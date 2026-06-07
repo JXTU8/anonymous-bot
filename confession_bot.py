@@ -147,9 +147,65 @@ def choice_keyboard():
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
 
+# ─── Known ad/spam domains — checked instantly before AI ─────────────────────
+# Add any domain you keep seeing spammed in confessions.
+AD_DOMAINS = {
+    # RedNote / XHS
+    "xhslink.com",
+    "xiaohongshu.com",
+    "xhs.link",
+    # Malaysian e-commerce
+    "shopee.com.my",
+    "lazada.com.my",
+    "temu.com",
+    # Generic shorteners often used for referral spam
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+    "rb.gy",
+    "shorturl.at",
+}
+
+
 def extract_urls(text: str) -> list:
-    """Return all http/https URLs found in text."""
-    return re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', text)
+    """
+    Return all URLs found in text.
+    Catches both explicit https:// links AND bare domain links
+    (e.g. xhslink.com/abc posted without a protocol prefix).
+    """
+    # Standard http/https links
+    explicit = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', text)
+
+    # Bare known-ad domains without protocol (e.g. "xhslink.com/abc123")
+    bare_pattern = r'\b(?:' + '|'.join(re.escape(d) for d in AD_DOMAINS) + r')[^\s]*'
+    bare = re.findall(bare_pattern, text, re.IGNORECASE)
+
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for u in explicit + bare:
+        if u not in seen:
+            seen.add(u)
+            result.append(u)
+    return result
+
+
+def is_blocklisted(urls: list) -> bool:
+    """
+    Return True if any URL belongs to a known ad/spam domain.
+    Handles both https://domain/path and bare domain/path formats.
+    """
+    for url in urls:
+        # Try to extract domain from URL with or without protocol
+        m = re.search(r'(?:https?://)?([^/\s?#]+)', url, re.IGNORECASE)
+        if not m:
+            continue
+        domain = m.group(1).lower().lstrip("www.")
+        for ad_domain in AD_DOMAINS:
+            if domain == ad_domain or domain.endswith("." + ad_domain):
+                logger.info("Blocklist hit: domain=%s matched rule=%s", domain, ad_domain)
+                return True
+    return False
 
 # ─── NEW Feature 2 helpers: Chinese detection & translation ───────────────────
 def has_chinese(text: str) -> bool:
@@ -246,7 +302,7 @@ CATEGORY_LABELS = {
     "spam":     "🚫 Spam",
 }
 
-FILTER_CONFIDENCE_THRESHOLD = 0.75  # Only flag when AI is ≥75% sure
+FILTER_CONFIDENCE_THRESHOLD = 0.60  # Flag when AI is ≥60% sure (lowered from 0.75)
 
 
 async def check_urls_serper(urls: list) -> list:
@@ -317,12 +373,16 @@ async def run_ai_filter(content: str, url_reputation: list = None) -> dict:
     system_prompt = (
         "You are a strict content-moderation AI for a Telegram anonymous confession bot.\n\n"
         "Flag ONLY two categories:\n"
-        "  1. AD      — unsolicited promotions, referral spam, MLM recruitment, product/service ads\n"
+        "  1. AD      — unsolicited promotions, referral spam, MLM recruitment, product/service ads,\n"
+        "               social media share links used to drive traffic (XHS, RedNote, Shopee, Lazada,\n"
+        "               TikTok shop links, referral codes, affiliate links, discount code sharing)\n"
         "  2. PHISHING — scam/malware URLs, fake prize offers, credential-harvesting links, financial fraud\n\n"
         "Rules:\n"
         "  • Genuine personal confessions (embarrassing stories, secrets, rants, opinions) → ALWAYS clean\n"
-        "  • Only flag when confidence ≥ 0.75 — when in doubt, return clean\n"
-        "  • A confession that casually mentions a brand or product is NOT an ad\n"
+        "  • Only flag when confidence ≥ 0.60 — when in doubt, flag for human review\n"
+        "  • A confession that casually MENTIONS a brand by name is NOT an ad\n"
+        "  • Sharing ANY link to a social media post, product listing, or referral URL IS an ad — flag it\n"
+        "  • XHS / xiaohongshu / RedNote links are ALWAYS ads — flag with category AD\n"
         "  • Use the URL reputation data (if provided) as strong evidence for phishing\n\n"
         "Respond with ONLY a raw JSON object — no markdown fences, no extra text:\n"
         '{"flagged": false, "category": "clean", "reason": "...", "confidence": 0.95}'
@@ -386,7 +446,93 @@ async def apply_filter(
         "🔍 _Scanning your confession…_", parse_mode="Markdown"
     )
 
-    urls          = extract_urls(content)
+    urls = extract_urls(content)
+
+    # ── Fast blocklist check — no AI cost, instant result ─────────────────
+    if is_blocklisted(urls):
+        await checking_msg.delete()
+        category   = "ad"
+        confidence = 1.0
+        reason     = "Domain is on the known ad/spam blocklist (e.g. XHS, Shopee referral link)."
+        category_label = CATEGORY_LABELS.get(category, "⚠️ Policy Violation")
+        user           = update.effective_user
+        username_str   = f"@{user.username}" if user.username else "no username"
+        timestamp      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        review_id      = uuid.uuid4().hex[:12]
+
+        pending_reviews[review_id] = {
+            "user_id":            user.id,
+            "chat_id":            update.effective_chat.id,
+            "full_name":          user.full_name,
+            "username_str":       username_str,
+            "user_data_snapshot": dict(context.user_data),
+            "category":           category,
+            "confidence":         confidence,
+            "reason":             reason,
+            "content":            content,
+            "timestamp":          timestamp,
+        }
+
+        logger.info(
+            "BLOCKLIST HIT | %-10s | 100%% | id=%s | user_id=%d | %s",
+            category, review_id, user.id, user.full_name,
+        )
+
+        review_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve (Anon)",   callback_data=f"rev_anon_{review_id}"),
+                InlineKeyboardButton("✅ Approve (Public)", callback_data=f"rev_pub_{review_id}"),
+            ],
+            [InlineKeyboardButton("❌ Reject", callback_data=f"rev_rej_{review_id}")],
+        ])
+
+        if ADMIN_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        f"🚫 *Blocklisted Domain Detected — Pending Review*\n"
+                        f"{'━' * 28}\n"
+                        f"👤 Name:       {user.full_name}\n"
+                        f"🔗 Username:   {username_str}\n"
+                        f"🆔 User ID:    `{user.id}`\n"
+                        f"🕐 Time:       {timestamp}\n"
+                        f"⚠️ Category:   {category_label}\n"
+                        f"🤖 Reason:     {reason}\n"
+                        f"📊 Confidence: 100% (blocklist)\n"
+                        f"{'━' * 28}\n"
+                        f"📝 Content:\n{content}"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=review_keyboard,
+                )
+            except Exception as exc:
+                logger.warning("Failed to send blocklist review to admin: %s", exc)
+
+        append_filter_log({
+            "timestamp":  timestamp,
+            "user_id":    user.id,
+            "full_name":  user.full_name,
+            "username":   username_str,
+            "category":   category,
+            "reason":     reason,
+            "confidence": confidence,
+            "content":    content,
+            "status":     "pending_review",
+            "review_id":  review_id,
+            "method":     "blocklist",
+        })
+
+        await update.message.reply_text(
+            "⏳ *Your confession is under admin review.*\n\n"
+            "An admin will look at it shortly and you'll be notified of the outcome.\n"
+            "Type /start if you'd like to submit a different confession in the meantime.",
+            parse_mode="Markdown",
+        )
+        context.user_data.clear()
+        return True
+
+    # ── AI filter (runs only if blocklist passed) ──────────────────────────
     url_rep       = await check_urls_serper(urls)
     filter_result = await run_ai_filter(content, url_rep)
 
