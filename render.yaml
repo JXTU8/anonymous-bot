@@ -1,5 +1,5 @@
 services:
-  - type: web                         # Web service = free tier eligible
+  - type: web
     name: confession-bot
     runtime: python
     plan: free
@@ -12,7 +12,11 @@ services:
         sync: false
       - key: ADMIN_CHAT_ID
         sync: false
-      - key: GROQ_API_KEY           # Get free key at console.groq.com
+      - key: GROQ_API_KEY
         sync: false
-      - key: SERPER_API_KEY         # Get free key at serper.dev (URL reputation)
+      - key: SERPER_API_KEY
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
         sync: false

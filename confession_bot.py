@@ -5,8 +5,10 @@ Telegram Anonymous Confession Bot
 - After typing, two buttons appear: Post Anonymously / Post Publicly
 - Admin always gets a silent DM with full sender identity
 - AI filter (Groq llama-3.3-70b + Serper) queues high-risk messages for
-  admin review instead of auto-deleting them          ← NEW Feature 1
-- Chinese text in confessions is auto-translated to English in the channel ← NEW Feature 2
+  admin review — never auto-deletes
+- Chinese text in confessions is auto-translated to English in the channel
+- Confession count persisted in Upstash Redis (survives bot restarts)
+- Pending reviews persisted in Upstash Redis (survives bot restarts)
 """
 
 import asyncio
@@ -15,7 +17,7 @@ import re
 import json
 import logging
 import threading
-import uuid                          # NEW — for generating unique review IDs
+import uuid
 from collections import Counter
 from datetime import datetime
 from flask import Flask
@@ -35,15 +37,20 @@ from telegram.ext import (
 load_dotenv()
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
-GROUP_CHAT_ID  = int(os.getenv("GROUP_CHAT_ID", "0"))
-ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "0"))
-PORT           = int(os.getenv("PORT", 8080))
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
-COUNTER_FILE   = "confession_count.json"
-LOG_FILE       = "confessions_log.json"
-FILTER_LOG     = "filtered_log.json"
+BOT_TOKEN           = os.getenv("BOT_TOKEN", "")
+GROUP_CHAT_ID       = int(os.getenv("GROUP_CHAT_ID", "0"))
+ADMIN_CHAT_ID       = int(os.getenv("ADMIN_CHAT_ID", "0"))
+PORT                = int(os.getenv("PORT", 8080))
+GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
+SERPER_API_KEY      = os.getenv("SERPER_API_KEY", "")
+UPSTASH_REDIS_URL   = os.getenv("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+LOG_FILE            = "confessions_log.json"
+FILTER_LOG          = "filtered_log.json"
+
+# ─── Redis keys ───────────────────────────────────────────────────────────────
+REDIS_COUNT_KEY   = "confession:count"
+REDIS_PENDING_KEY = "confession:pending_reviews"
 
 # ─── Groq client (optional — features silently degrade without it) ────────────
 try:
@@ -79,18 +86,111 @@ def health():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT)
 
-# ─── Persistence helpers ──────────────────────────────────────────────────────
-def load_count() -> int:
+# ─── Upstash Redis helpers ────────────────────────────────────────────────────
+def _redis(method: str, *path_parts, body=None):
+    """
+    Thin wrapper around the Upstash Redis REST API.
+    Returns the parsed JSON response, or None on error.
+    """
+    if not UPSTASH_REDIS_URL or not UPSTASH_REDIS_TOKEN:
+        return None
+    url = UPSTASH_REDIS_URL.rstrip("/") + "/" + "/".join(str(p) for p in path_parts)
+    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
     try:
-        with open(COUNTER_FILE) as f:
-            return json.load(f).get("count", 0)
-    except (FileNotFoundError, json.JSONDecodeError):
+        if body is not None:
+            resp = http_requests.post(url, headers=headers, json=body, timeout=5)
+        else:
+            resp = http_requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        logger.warning("Redis REST error (%s): %s", method, exc)
+        return None
+
+
+def redis_get(key: str):
+    """GET key — returns the value string or None."""
+    result = _redis("GET", "get", key)
+    if result and "result" in result:
+        return result["result"]
+    return None
+
+
+def redis_set(key: str, value: str) -> bool:
+    """SET key value."""
+    result = _redis("SET", "set", key, value)
+    return result is not None
+
+
+def redis_incr(key: str) -> int:
+    """INCR key — atomic increment, returns new value."""
+    result = _redis("INCR", "incr", key)
+    if result and "result" in result:
+        return int(result["result"])
+    return 0
+
+
+def redis_decr(key: str) -> int:
+    """DECR key — atomic decrement, floors at 0 via a follow-up check."""
+    result = _redis("DECR", "decr", key)
+    if result and "result" in result:
+        val = int(result["result"])
+        if val < 0:
+            redis_set(key, "0")
+            return 0
+        return val
+    return 0
+
+
+# ─── Confession counter (Redis-backed) ────────────────────────────────────────
+def load_count() -> int:
+    """Read confession counter from Redis. Falls back to 0 if unavailable."""
+    val = redis_get(REDIS_COUNT_KEY)
+    try:
+        return int(val) if val is not None else 0
+    except (ValueError, TypeError):
         return 0
 
-def save_count(n: int) -> None:
-    with open(COUNTER_FILE, "w") as f:
-        json.dump({"count": n}, f)
 
+def save_count(n: int) -> None:
+    """Write confession counter to Redis."""
+    redis_set(REDIS_COUNT_KEY, str(n))
+
+
+def incr_count() -> int:
+    """Atomically increment and return new confession count."""
+    new_val = redis_incr(REDIS_COUNT_KEY)
+    if new_val == 0:
+        # Redis unavailable — fall back to in-memory increment
+        global confession_count
+        confession_count += 1
+        return confession_count
+    return new_val
+
+
+def decr_count() -> None:
+    """Atomically decrement confession count (rollback on post failure)."""
+    redis_decr(REDIS_COUNT_KEY)
+
+
+# ─── Pending reviews (Redis-backed) ───────────────────────────────────────────
+def load_pending_reviews() -> dict:
+    """Load pending reviews dict from Redis."""
+    raw = redis_get(REDIS_PENDING_KEY)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def save_pending_reviews(data: dict) -> None:
+    """Persist pending reviews dict to Redis."""
+    redis_set(REDIS_PENDING_KEY, json.dumps(data, ensure_ascii=False))
+
+
+# ─── Log file helpers (kept as-is — logs are append-only, Redis not needed) ───
 def load_log() -> list:
     try:
         with open(LOG_FILE) as f:
@@ -117,22 +217,11 @@ def append_filter_log(entry: dict) -> None:
     with open(FILTER_LOG, "w") as f:
         json.dump(log, f, ensure_ascii=False, indent=2)
 
-confession_count = load_count()
+confession_count = 0  # loaded from Redis in main() — do not use before that
 
-# ─── NEW: In-memory store for confessions awaiting admin review ───────────────
-# Keyed by a 12-char hex review_id (generated per flagged message).
-# Each entry holds everything needed to post the confession later if approved.
-# Note: this is in-memory only — pending reviews are lost on bot restart.
-# For persistence, you could serialise this dict to a JSON file similarly to
-# the other log files above.
-#
-# Schema:
-#   { review_id: {
-#       user_id, chat_id, full_name, username_str,
-#       user_data_snapshot,   # copy of context.user_data at filter time
-#       category, confidence, reason, content, timestamp
-#   } }
-pending_reviews: dict = {}
+# ─── Pending reviews — loaded from Redis on startup ──────────────────────────
+# Persisted to Redis after every change so reviews survive bot restarts.
+pending_reviews: dict = {}   # populated in main() after Redis is ready
 
 # ─── General helpers ──────────────────────────────────────────────────────────
 def is_admin(user_id: int) -> bool:
@@ -472,6 +561,7 @@ async def apply_filter(
             "content":            content,
             "timestamp":          timestamp,
         }
+        save_pending_reviews(pending_reviews)
 
         logger.info(
             "BLOCKLIST HIT | %-10s | 100%% | id=%s | user_id=%d | %s",
@@ -568,6 +658,7 @@ async def apply_filter(
         "content":            content,
         "timestamp":          timestamp,
     }
+    save_pending_reviews(pending_reviews)
 
     logger.info(
         "PENDING REVIEW | %-10s | %.0f%% | id=%s | user_id=%d | %s",
@@ -665,6 +756,8 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Pop from dict so double-clicks are safely ignored
     review = pending_reviews.pop(review_id, None)
+    if review:
+        save_pending_reviews(pending_reviews)  # persist removal to Redis
     if not review:
         await query.answer("⚠️ Already handled or expired.", show_alert=True)
         try:
@@ -707,8 +800,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ── APPROVE ───────────────────────────────────────────────────────────
     is_anonymous = (action == "approve_anon")
-    confession_count += 1
-    save_count(confession_count)
+    confession_count = incr_count()
     post_type = "Anonymous" if is_anonymous else "Public"
 
     if is_anonymous:
@@ -805,12 +897,13 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as exc:
         # Roll back the counter if posting failed
         logger.error("Failed to post admin-approved confession: %s", exc)
-        confession_count -= 1
-        save_count(confession_count)
+        decr_count()
+        global confession_count
+        confession_count = load_count()
         try:
             await query.edit_message_text(
                 original_text
-                + "\n\n⚠️ *Post failed — is the bot an admin in the channel?*",
+                + "\n\n⚠️ *Post failed. Make sure your message doesn't include advertisement.*",
                 parse_mode="Markdown",
             )
         except Exception:
@@ -903,8 +996,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         display_name = f"@{user.username}" if user.username else user.full_name
         author_label = f"👤 *Confession #{confession_count + 1} by {display_name}*"
 
-    confession_count += 1
-    save_count(confession_count)
+    confession_count = incr_count()
 
     msg_type = ud.get("type")
     content  = ud.get("content", "")
@@ -990,11 +1082,12 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     except Exception as exc:
         logger.error("Failed to post confession #%d: %s", confession_count, exc)
-        confession_count -= 1
-        save_count(confession_count)
+        decr_count()
+        global confession_count
+        confession_count = load_count()
         await query.edit_message_text(
             "❌ Couldn't post your confession.\n"
-            "Make sure the bot is an admin in the channel."
+            "Make sure your message doesn't include advertisement."
         )
 
     context.user_data.clear()
@@ -1186,6 +1279,15 @@ def main() -> None:
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         prompt_start,
     ))
+
+    # ── Load persistent state from Redis ──────────────────────────────────
+    global confession_count, pending_reviews
+    confession_count = load_count()
+    pending_reviews  = load_pending_reviews()
+    logger.info(
+        "Loaded from Redis — confession_count=%d, pending_reviews=%d",
+        confession_count, len(pending_reviews),
+    )
 
     print("🤖  Confession bot is running.")
     telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
