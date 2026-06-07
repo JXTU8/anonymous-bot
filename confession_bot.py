@@ -636,11 +636,11 @@ async def apply_filter(
                 await context.bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
                     text=(
-                        f"🚫 *Blocklisted Domain Detected — Pending Review*\n"
+                        f"🚫 Blocklisted Domain Detected — Pending Review\n"
                         f"{'━' * 28}\n"
                         f"👤 Name:       {user.full_name}\n"
                         f"🔗 Username:   {username_str}\n"
-                        f"🆔 User ID:    `{user.id}`\n"
+                        f"🆔 User ID:    {user.id}\n"
                         f"🕐 Time:       {timestamp}\n"
                         f"⚠️ Category:   {category_label}\n"
                         f"🤖 Reason:     {reason}\n"
@@ -648,7 +648,6 @@ async def apply_filter(
                         f"{'━' * 28}\n"
                         f"📝 Content:\n{content}"
                     ),
-                    parse_mode="Markdown",
                     reply_markup=review_keyboard,
                 )
             except Exception as exc:
@@ -753,11 +752,11 @@ async def apply_filter(
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=(
-                    f"⚠️ *High-Risk Confession — Pending Your Review*\n"
+                    f"⚠️ High-Risk Confession — Pending Your Review\n"
                     f"{'━' * 28}\n"
                     f"👤 Name:       {user.full_name}\n"
                     f"🔗 Username:   {username_str}\n"
-                    f"🆔 User ID:    `{user.id}`\n"
+                    f"🆔 User ID:    {user.id}\n"
                     f"🕐 Time:       {timestamp}\n"
                     f"⚠️ Category:   {category_label}\n"
                     f"🤖 AI Reason:  {reason}\n"
@@ -765,7 +764,6 @@ async def apply_filter(
                     f"{'━' * 28}\n"
                     f"📝 Content:\n{content}"
                 ),
-                parse_mode="Markdown",
                 reply_markup=review_keyboard,
             )
         except Exception as exc:
@@ -885,8 +883,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Update the review card (removes buttons, appends status)
         try:
             await query.edit_message_text(
-                original_text + "\n\n❌ *Rejected by admin.*",
-                parse_mode="Markdown",
+                original_text + "\n\n❌ Rejected by admin.",
             )
         except Exception as exc:
             logger.warning("Could not edit review card after rejection: %s", exc)
@@ -1016,8 +1013,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await query.edit_message_text(
                 original_text
-                + f"\n\n✅ *Approved — posted as Confession #{confession_count} ({post_type}).*",
-                parse_mode="Markdown",
+                + f"\n\n✅ Approved — posted as Confession #{confession_count} ({post_type}).",
             )
         except Exception as exc:
             logger.warning("Could not edit review card after approval: %s", exc)
@@ -1036,8 +1032,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await query.edit_message_text(
                 original_text
-                + "\n\n⚠️ *Post failed. Make sure your message doesn't include advertisement.*",
-                parse_mode="Markdown",
+                + "\n\n⚠️ Post failed. Make sure your message doesn't include advertisement.",
             )
         except Exception:
             pass
@@ -1340,9 +1335,60 @@ async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🆔 `{rid}` | {r['full_name']} | {cat_label} | {r['timestamp']}"
         )
     lines.append(f"\n{'━' * 28}")
-    lines.append("_Re-send /start on each case to re-trigger the review card if needed._")
+    lines.append("Use /review <id> to resend the approval buttons for a pending confession.")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def resend_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resend the Approve / Reject card for a pending review id."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /review <pending_id>")
+        return
+
+    review_id = context.args[0].strip()
+    review = pending_reviews.get(review_id)
+    if not review:
+        await update.message.reply_text("❌ No pending review found for that ID.")
+        return
+
+    category = review.get("category", "unknown")
+    category_label = CATEGORY_LABELS.get(category, category)
+    try:
+        confidence = float(review.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    method = review.get("moderation", {}).get("method") or review.get("method") or "moderation"
+
+    review_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve (Anon)",   callback_data=f"rev_anon_{review_id}"),
+            InlineKeyboardButton("✅ Approve (Public)", callback_data=f"rev_pub_{review_id}"),
+        ],
+        [InlineKeyboardButton("❌ Reject", callback_data=f"rev_rej_{review_id}")],
+    ])
+
+    await update.message.reply_text(
+        (
+            f"⚠️ Pending Confession Review\n"
+            f"{'━' * 28}\n"
+            f"🆔 Review ID:  {review_id}\n"
+            f"👤 Name:       {review.get('full_name', '?')}\n"
+            f"🔗 Username:   {review.get('username_str', '?')}\n"
+            f"🆔 User ID:    {review.get('user_id', '?')}\n"
+            f"🕐 Time:       {review.get('timestamp', '?')}\n"
+            f"⚠️ Category:   {category_label}\n"
+            f"🤖 Reason:     {review.get('reason', '?')}\n"
+            f"📊 Confidence: {confidence:.0%} ({method})\n"
+            f"{'━' * 28}\n"
+            f"📝 Content:\n{review.get('content', '')}"
+        ),
+        reply_markup=review_keyboard,
+    )
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -1407,6 +1453,7 @@ def main() -> None:
     telegram_app.add_handler(CommandHandler("lookup",       lookup))
     telegram_app.add_handler(CommandHandler("filter_stats", filter_stats))
     telegram_app.add_handler(CommandHandler("pending",      list_pending))   # NEW
+    telegram_app.add_handler(CommandHandler("review",       resend_review))
 
     # Catch any message sent outside the /start flow
     telegram_app.add_handler(MessageHandler(
