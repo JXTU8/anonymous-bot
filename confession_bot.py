@@ -734,8 +734,6 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         rev_pub_<12-hex>    → approve and post publicly
         rev_rej_<12-hex>    → reject (notify user, discard confession)
     """
-    global confession_count
-
     query = update.callback_query
     await query.answer()
 
@@ -896,10 +894,8 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as exc:
         # Roll back the counter if posting failed
-        global confession_count
         logger.error("Failed to post admin-approved confession: %s", exc)
         decr_count()
-        confession_count = load_count()
         try:
             await query.edit_message_text(
                 original_text
@@ -972,8 +968,6 @@ async def receive_confession(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ─── Handle button click ──────────────────────────────────────────────────────
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    global confession_count
-
     query = update.callback_query
     await query.answer()
 
@@ -1081,10 +1075,8 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
 
     except Exception as exc:
-        global confession_count
-        logger.error("Failed to post confession #%d: %s", confession_count, exc)
+        logger.error("Failed to post confession: %s", exc)
         decr_count()
-        confession_count = load_count()
         await query.edit_message_text(
             "❌ Couldn't post your confession.\n"
             "Make sure your message doesn't include advertisement."
