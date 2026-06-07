@@ -12,3 +12,7 @@ services:
         sync: false
       - key: ADMIN_CHAT_ID
         sync: false
+      - key: GROQ_API_KEY           # Get free key at console.groq.com
+        sync: false
+      - key: SERPER_API_KEY         # Get free key at serper.dev (URL reputation)
+        sync: false

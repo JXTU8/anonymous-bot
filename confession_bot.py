@@ -4,15 +4,20 @@ Telegram Anonymous Confession Bot
 - User must /start every time to send a confession
 - After typing, two buttons appear: Post Anonymously / Post Publicly
 - Admin always gets a silent DM with full sender identity
+- AI filter (Groq llama-3.3-70b + Serper) blocks ads & phishing links
 """
 
+import asyncio
 import os
+import re
 import json
 import logging
 import threading
+from collections import Counter
 from datetime import datetime
 from flask import Flask
 from dotenv import load_dotenv
+import requests as http_requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -27,12 +32,24 @@ from telegram.ext import (
 load_dotenv()
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-PORT          = int(os.getenv("PORT", 8080))
-COUNTER_FILE  = "confession_count.json"
-LOG_FILE      = "confessions_log.json"
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
+GROUP_CHAT_ID  = int(os.getenv("GROUP_CHAT_ID", "0"))
+ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "0"))
+PORT           = int(os.getenv("PORT", 8080))
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
+COUNTER_FILE   = "confession_count.json"
+LOG_FILE       = "confessions_log.json"
+FILTER_LOG     = "filtered_log.json"
+
+# ─── Groq client (optional — filter is silently disabled without it) ──────────
+try:
+    from groq import Groq
+    groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+except ImportError:
+    groq_client = None
+
+FILTER_ENABLED = bool(groq_client)
 
 # ─── Conversation states ──────────────────────────────────────────────────────
 WAITING_CONFESSION = 1
@@ -84,9 +101,22 @@ def append_log(entry: dict) -> None:
     with open(LOG_FILE, "w") as f:
         json.dump(log, f, ensure_ascii=False, indent=2)
 
+def load_filter_log() -> list:
+    try:
+        with open(FILTER_LOG) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def append_filter_log(entry: dict) -> None:
+    log = load_filter_log()
+    log.append(entry)
+    with open(FILTER_LOG, "w") as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+
 confession_count = load_count()
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── General helpers ──────────────────────────────────────────────────────────
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_CHAT_ID) and user_id == ADMIN_CHAT_ID
 
@@ -98,6 +128,224 @@ def choice_keyboard():
         ],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
+
+def extract_urls(text: str) -> list:
+    """Return all http/https URLs found in text."""
+    return re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', text)
+
+# ─── AI Filter ────────────────────────────────────────────────────────────────
+CATEGORY_LABELS = {
+    "ad":       "📢 Advertisement / Promo Spam",
+    "phishing": "🎣 Phishing / Scam Link",
+    "spam":     "🚫 Spam",
+}
+
+FILTER_CONFIDENCE_THRESHOLD = 0.75  # Only block when AI is ≥75% sure
+
+
+async def check_urls_serper(urls: list) -> list:
+    """
+    Query Serper (Google Search API) for reputation data on extracted URLs.
+    Caps at 2 URLs to keep latency acceptable.
+    Returns a list of {url, domain, snippets} dicts.
+    """
+    if not SERPER_API_KEY or not urls:
+        return []
+
+    results = []
+    for url in urls[:2]:
+        try:
+            m      = re.search(r'https?://([^/\s?#]+)', url)
+            domain = m.group(1) if m else url
+
+            def _search(d=domain):
+                return http_requests.post(
+                    "https://google.serper.dev/search",
+                    headers={
+                        "X-API-KEY":    SERPER_API_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json={"q": f"{d} phishing OR scam OR malware OR fraud", "num": 5},
+                    timeout=6,
+                )
+
+            resp = await asyncio.to_thread(_search)
+            resp.raise_for_status()
+            data = resp.json()
+
+            snippets = [
+                r.get("snippet", "")
+                for r in data.get("organic", [])[:4]
+                if r.get("snippet")
+            ]
+            results.append({"url": url, "domain": domain, "snippets": snippets})
+            logger.info("Serper checked domain: %s (%d snippets)", domain, len(snippets))
+
+        except Exception as exc:
+            logger.warning("Serper lookup failed for %s: %s", url, exc)
+
+    return results
+
+
+async def run_ai_filter(content: str, url_reputation: list = None) -> dict:
+    """
+    Send confession text + optional URL reputation context to Groq for moderation.
+
+    Returns:
+        {"flagged": bool, "category": str, "reason": str, "confidence": float}
+
+    Fails OPEN (returns clean) if the API is unavailable — confessions are never
+    silently lost due to a filter outage.
+    """
+    if not groq_client:
+        return {"flagged": False, "category": "clean", "reason": "AI filter not configured", "confidence": 0.0}
+
+    # Build URL context block from Serper results
+    url_block = ""
+    if url_reputation:
+        url_block = "\n\n[Live URL Reputation — sourced from Google Search]\n"
+        for item in url_reputation:
+            url_block += f"\nDomain: {item['domain']}\n"
+            for snippet in item.get("snippets", []):
+                url_block += f"  • {snippet}\n"
+
+    system_prompt = (
+        "You are a strict content-moderation AI for a Telegram anonymous confession bot.\n\n"
+        "Flag ONLY two categories:\n"
+        "  1. AD      — unsolicited promotions, referral spam, MLM recruitment, product/service ads\n"
+        "  2. PHISHING — scam/malware URLs, fake prize offers, credential-harvesting links, financial fraud\n\n"
+        "Rules:\n"
+        "  • Genuine personal confessions (embarrassing stories, secrets, rants, opinions) → ALWAYS clean\n"
+        "  • Only flag when confidence ≥ 0.75 — when in doubt, return clean\n"
+        "  • A confession that casually mentions a brand or product is NOT an ad\n"
+        "  • Use the URL reputation data (if provided) as strong evidence for phishing\n\n"
+        "Respond with ONLY a raw JSON object — no markdown fences, no extra text:\n"
+        '{"flagged": false, "category": "clean", "reason": "...", "confidence": 0.95}'
+    )
+
+    user_msg = f"Confession to analyze:\n\n{content}{url_block}"
+
+    raw = ""
+    def _call():
+        return groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0,
+            max_tokens=150,
+        )
+
+    try:
+        resp = await asyncio.to_thread(_call)
+        raw  = resp.choices[0].message.content.strip()
+
+        # Strip accidental markdown code fences
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+            raw = re.sub(r"\n?```\s*$",           "", raw)
+        raw = raw.strip()
+
+        result = json.loads(raw)
+        # Normalise 'flagged' in case model returns string "true"/"false"
+        result["flagged"] = str(result.get("flagged", False)).lower() == "true"
+        return result
+
+    except json.JSONDecodeError:
+        logger.warning("Groq returned non-JSON (letting through): %.300s", raw)
+        return {"flagged": False, "category": "clean", "reason": "parse error", "confidence": 0.0}
+    except Exception as exc:
+        logger.error("Groq filter error (letting through): %s", exc)
+        return {"flagged": False, "category": "clean", "reason": str(exc), "confidence": 0.0}
+
+
+async def apply_filter(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    content: str,
+) -> bool:
+    """
+    Full filter pipeline: Serper URL lookup → Groq AI analysis → block or pass.
+
+    Returns True  → message is blocked (caller should end the conversation).
+    Returns False → message is clean / filter is off (caller should proceed).
+    """
+    if not FILTER_ENABLED or not content or content == "(voice message)":
+        return False  # Nothing to check
+
+    checking_msg = await update.message.reply_text(
+        "🔍 _Scanning your confession…_", parse_mode="Markdown"
+    )
+
+    urls          = extract_urls(content)
+    url_rep       = await check_urls_serper(urls)
+    filter_result = await run_ai_filter(content, url_rep)
+
+    await checking_msg.delete()
+
+    confidence = filter_result.get("confidence", 0.0)
+    if not filter_result.get("flagged") or confidence < FILTER_CONFIDENCE_THRESHOLD:
+        return False  # ✅ Clean — let it through
+
+    # ── Blocked ────────────────────────────────────────────────────────────
+    category       = filter_result.get("category", "spam")
+    reason         = filter_result.get("reason", "Policy violation detected.")
+    category_label = CATEGORY_LABELS.get(category, "⚠️ Policy Violation")
+    user           = update.effective_user
+    username_str   = f"@{user.username}" if user.username else "no username"
+    timestamp      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    logger.info(
+        "BLOCKED | %-10s | %.0f%% confidence | user_id=%-12d | %s",
+        category, confidence * 100, user.id, user.full_name,
+    )
+
+    # Silent admin alert
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    f"🚫 *Blocked Confession Attempt*\n"
+                    f"{'━' * 28}\n"
+                    f"👤 Name:        {user.full_name}\n"
+                    f"🔗 Username:    {username_str}\n"
+                    f"🆔 User ID:     `{user.id}`\n"
+                    f"🕐 Time:        {timestamp}\n"
+                    f"⚠️ Category:    {category_label}\n"
+                    f"🤖 AI Reason:   {reason}\n"
+                    f"📊 Confidence:  {confidence:.0%}\n"
+                    f"{'━' * 28}\n"
+                    f"📝 Content:\n{content}"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            logger.warning("Admin block-notification failed: %s", exc)
+
+    # Persist to filter log
+    append_filter_log({
+        "timestamp":  timestamp,
+        "user_id":    user.id,
+        "full_name":  user.full_name,
+        "username":   username_str,
+        "category":   category,
+        "reason":     reason,
+        "confidence": confidence,
+        "content":    content,
+    })
+
+    await update.message.reply_text(
+        f"🚫 *Confession Blocked*\n\n"
+        f"Your message was flagged as: *{category_label}*\n"
+        f"_{reason}_\n\n"
+        f"If you believe this is a mistake, type /start and rephrase your message.",
+        parse_mode="Markdown",
+    )
+    context.user_data.clear()
+    return True  # Blocked
+
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -145,6 +393,12 @@ async def receive_confession(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return WAITING_CONFESSION
 
+    # ── AI Filter (skips voice-only since there is no analyzable text) ─────
+    blocked = await apply_filter(update, context, ud.get("content", ""))
+    if blocked:
+        return ConversationHandler.END
+
+    # ── All clear — show posting options ───────────────────────────────────
     await update.message.reply_text(
         f"📝 *Your confession:*\n_{preview}_\n\n"
         "How do you want to post this?",
@@ -216,7 +470,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 parse_mode="Markdown",
             )
 
-        # ── Notify admin silently ──────────────────────────────────────────
+        # ── Silent admin notification ──────────────────────────────────────
         timestamp    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         username_str = f"@{user.username}" if user.username else "no username"
         post_type    = "Anonymous" if is_anonymous else "Public"
@@ -254,7 +508,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             f"Type /start to send another confession.",
             parse_mode="Markdown",
         )
-        logger.info("Confession #%d | %s | user_id=%d | %s", confession_count, post_type, user.id, user.full_name)
+        logger.info(
+            "Confession #%d | %s | user_id=%d | %s",
+            confession_count, post_type, user.id, user.full_name,
+        )
 
     except Exception as exc:
         logger.error("Failed to post confession #%d: %s", confession_count, exc)
@@ -320,22 +577,68 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
 
+# ─── Admin: /filter_stats ─────────────────────────────────────────────────────
+async def filter_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show how many confessions have been blocked and by which category."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+
+    log   = load_filter_log()
+    total = len(log)
+
+    if total == 0:
+        await update.message.reply_text(
+            "✅ No confessions have been blocked by the AI filter yet.\n"
+            f"Filter status: {'🟢 Active' if FILTER_ENABLED else '🔴 Disabled (set GROQ_API_KEY)'}"
+        )
+        return
+
+    cats  = Counter(e.get("category", "unknown") for e in log)
+    lines = [
+        f"🚫 *AI Filter Statistics*",
+        f"{'━' * 28}",
+        f"Status: {'🟢 Active' if FILTER_ENABLED else '🔴 Disabled'}",
+        f"Total blocked: *{total}*\n",
+    ]
+
+    for cat, count in cats.most_common():
+        label = CATEGORY_LABELS.get(cat, cat)
+        lines.append(f"{label}: *{count}*")
+
+    recent = log[-1]
+    lines += [
+        f"\n{'━' * 28}",
+        f"Last blocked: {recent['timestamp']}",
+        f"Category: {CATEGORY_LABELS.get(recent.get('category', ''), '?')}",
+        f"Confidence: {recent.get('confidence', 0):.0%}",
+    ]
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 def main() -> None:
     if not BOT_TOKEN:
         print("❌  BOT_TOKEN is not set.")
         return
 
-    # Fix for Python 3.10+ — explicitly create an event loop before anything async
-    import asyncio
+    if not FILTER_ENABLED:
+        logger.warning(
+            "AI filter is DISABLED — add GROQ_API_KEY to your environment to enable it."
+        )
+    else:
+        serper_status = "Groq + Serper (URL reputation enabled)" if SERPER_API_KEY else "Groq only (no URL reputation)"
+        logger.info("AI filter is ENABLED — %s", serper_status)
+
+    # Fix for Python 3.10+ event-loop policy
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-    # Start Flask in a background thread so Render sees an HTTP server
+    # Start Flask in background thread so Render sees an HTTP server
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("Flask health server started on port %d", PORT)
 
-    # Build app
+    # Build Telegram app
     telegram_app = Application.builder().token(BOT_TOKEN).build()
 
     # Confession conversation flow
@@ -355,10 +658,11 @@ def main() -> None:
     )
 
     telegram_app.add_handler(conv_handler)
-    telegram_app.add_handler(CommandHandler("getid",  get_chat_id))
-    telegram_app.add_handler(CommandHandler("lookup", lookup))
+    telegram_app.add_handler(CommandHandler("getid",        get_chat_id))
+    telegram_app.add_handler(CommandHandler("lookup",       lookup))
+    telegram_app.add_handler(CommandHandler("filter_stats", filter_stats))  # NEW
 
-    # Catch any message sent outside of /start flow
+    # Catch any message sent outside the /start flow
     telegram_app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         prompt_start,
@@ -366,6 +670,7 @@ def main() -> None:
 
     print("🤖  Confession bot is running.")
     telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
