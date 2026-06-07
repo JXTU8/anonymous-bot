@@ -907,7 +907,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
     post_type = "Anonymous" if is_anonymous else "Public"
 
     if is_anonymous:
-        author_label = f"🤫 *Anonymous Confession #{confession_count}*"
+        author_label = f"🤫 Anonymous Confession #{confession_count}"
     else:
         # Use the stored username/name from when the confession was submitted
         display_name = (
@@ -915,7 +915,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             if review["username_str"] != "no username"
             else review["full_name"]
         )
-        author_label = f"👤 *Confession #{confession_count} by {display_name}*"
+        author_label = f"👤 Confession #{confession_count} by {display_name}"
 
     msg_type = ud.get("type")
     content  = ud.get("content", "")
@@ -927,28 +927,24 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID,
                 text=f"{author_label}\n\n{content}",
-                parse_mode="Markdown",
             )
         elif msg_type == "photo":
             await context.bot.send_photo(
                 chat_id=GROUP_CHAT_ID,
                 photo=file_id,
                 caption=f"{author_label}\n\n{content}",
-                parse_mode="Markdown",
             )
         elif msg_type == "video":
             await context.bot.send_video(
                 chat_id=GROUP_CHAT_ID,
                 video=file_id,
                 caption=f"{author_label}\n\n{content}",
-                parse_mode="Markdown",
             )
         elif msg_type == "voice":
             await context.bot.send_voice(
                 chat_id=GROUP_CHAT_ID,
                 voice=file_id,
                 caption=author_label,
-                parse_mode="Markdown",
             )
 
         # ── Feature 2: auto-translate Chinese content (if any) ────────────
@@ -1120,10 +1116,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     confession_count = incr_count()
 
     if is_anonymous:
-        author_label = f"🤫 *Anonymous Confession #{confession_count}*"
+        author_label = f"🤫 Anonymous Confession #{confession_count}"
     else:
         display_name = f"@{user.username}" if user.username else user.full_name
-        author_label = f"👤 *Confession #{confession_count} by {display_name}*"
+        author_label = f"👤 Confession #{confession_count} by {display_name}"
 
     msg_type = ud.get("type")
     content  = ud.get("content", "")
@@ -1135,28 +1131,24 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID,
                 text=f"{author_label}\n\n{content}",
-                parse_mode="Markdown",
             )
         elif msg_type == "photo":
             await context.bot.send_photo(
                 chat_id=GROUP_CHAT_ID,
                 photo=file_id,
                 caption=f"{author_label}\n\n{content}",
-                parse_mode="Markdown",
             )
         elif msg_type == "video":
             await context.bot.send_video(
                 chat_id=GROUP_CHAT_ID,
                 video=file_id,
                 caption=f"{author_label}\n\n{content}",
-                parse_mode="Markdown",
             )
         elif msg_type == "voice":
             await context.bot.send_voice(
                 chat_id=GROUP_CHAT_ID,
                 voice=file_id,
                 caption=author_label,
-                parse_mode="Markdown",
             )
 
         # ── Feature 2: Auto-translate Chinese content ──────────────────────
@@ -1174,16 +1166,15 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 await context.bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
                     text=(
-                        f"🔔 *New Confession #{confession_count}* ({post_type})\n"
+                        f"🔔 New Confession #{confession_count} ({post_type})\n"
                         f"{'━' * 28}\n"
                         f"👤 Name: {user.full_name}\n"
                         f"🔗 Username: {username_str}\n"
-                        f"🆔 User ID: `{user.id}`\n"
+                        f"🆔 User ID: {user.id}\n"
                         f"🕐 Time: {timestamp}\n"
                         f"{'━' * 28}\n"
                         f"📝 Content:\n{content}"
                     ),
-                    parse_mode="Markdown",
                 )
             except Exception as exc:
                 logger.warning("Failed to send admin notification for confession #%d: %s", confession_count, exc)
