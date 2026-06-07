@@ -48,6 +48,10 @@ UPSTASH_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 LOG_FILE            = "confessions_log.json"
 FILTER_LOG          = "filtered_log.json"
 
+STATUS_PUBLISHED = "published"
+STATUS_PENDING_APPROVAL = "pending_approval"
+STATUS_REJECTED = "rejected"
+
 # ─── Redis keys ───────────────────────────────────────────────────────────────
 REDIS_COUNT_KEY   = "confession:count"
 REDIS_PENDING_KEY = "confession:pending_reviews"
@@ -204,6 +208,19 @@ def append_log(entry: dict) -> None:
     with open(LOG_FILE, "w") as f:
         json.dump(log, f, ensure_ascii=False, indent=2)
 
+def update_log_by_review_id(review_id: str, updates: dict) -> bool:
+    log = load_log()
+    changed = False
+    for entry in log:
+        if entry.get("review_id") == review_id:
+            entry.update(updates)
+            changed = True
+            break
+    if changed:
+        with open(LOG_FILE, "w") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+    return changed
+
 def load_filter_log() -> list:
     try:
         with open(FILTER_LOG) as f:
@@ -216,6 +233,19 @@ def append_filter_log(entry: dict) -> None:
     log.append(entry)
     with open(FILTER_LOG, "w") as f:
         json.dump(log, f, ensure_ascii=False, indent=2)
+
+def update_filter_log_by_review_id(review_id: str, updates: dict) -> bool:
+    log = load_filter_log()
+    changed = False
+    for entry in log:
+        if entry.get("review_id") == review_id:
+            entry.update(updates)
+            changed = True
+            break
+    if changed:
+        with open(FILTER_LOG, "w") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+    return changed
 
 confession_count = 0  # loaded from Redis in main() — do not use before that
 
@@ -460,21 +490,28 @@ async def run_ai_filter(content: str, url_reputation: list = None) -> dict:
                 url_block += f"  • {snippet}\n"
 
     system_prompt = (
-        "You are a strict content-moderation AI for a Telegram anonymous confession bot.\n\n"
-        "Flag ONLY two categories:\n"
-        "  1. AD      — unsolicited promotions, referral spam, MLM recruitment, product/service ads,\n"
-        "               social media share links used to drive traffic (XHS, RedNote, Shopee, Lazada,\n"
-        "               TikTok shop links, referral codes, affiliate links, discount code sharing)\n"
-        "  2. PHISHING — scam/malware URLs, fake prize offers, credential-harvesting links, financial fraud\n\n"
-        "Rules:\n"
-        "  • Genuine personal confessions (embarrassing stories, secrets, rants, opinions) → ALWAYS clean\n"
-        "  • Only flag when confidence ≥ 0.60 — when in doubt, flag for human review\n"
-        "  • A confession that casually MENTIONS a brand by name is NOT an ad\n"
-        "  • Sharing ANY link to a social media post, product listing, or referral URL IS an ad — flag it\n"
-        "  • XHS / xiaohongshu / RedNote links are ALWAYS ads — flag with category AD\n"
-        "  • Use the URL reputation data (if provided) as strong evidence for phishing\n\n"
-        "Respond with ONLY a raw JSON object — no markdown fences, no extra text:\n"
-        '{"flagged": false, "category": "clean", "reason": "...", "confidence": 0.95}'
+        "You are a precision content-moderation classifier for a Telegram anonymous confession bot.\n\n"
+        "Your job is NOT to judge whether a confession is embarrassing, rude, emotional, sexual, sad, "
+        "or controversial. Personal confessions, secrets, rants, relationship stories, school/work drama, "
+        "and opinions are clean unless they are clearly ad spam or phishing/scam content.\n\n"
+        "Allowed categories:\n"
+        "  clean: normal confession content, including casual brand mentions without promotion.\n"
+        "  ad: unsolicited promotion, referral/affiliate spam, MLM recruitment, product/service selling, "
+        "traffic-driving social/shop links, discount codes, repeated copy-paste marketing, or calls to DM/buy/join.\n"
+        "  phishing: scam, malware, fake prize/job/investment offer, credential harvesting, financial fraud, "
+        "or a URL with strong scam/phishing reputation evidence.\n\n"
+        "Decision rules:\n"
+        "  - Do not flag just because a message mentions Shopee, Lazada, TikTok, RedNote/XHS, a brand, or a price.\n"
+        "  - Flag as ad when the message is trying to promote, sell, recruit, drive traffic, share a referral, "
+        "or contains a product/social/referral link with promotional intent.\n"
+        "  - Flag XHS/xiaohongshu/RedNote, ecommerce, shortener, referral, affiliate, or shop links as ad unless "
+        "the surrounding confession is clearly discussing them without promotion.\n"
+        "  - Flag as phishing only when there is scam/fraud language, suspicious financial/credential claims, "
+        "or URL reputation snippets strongly indicate phishing, malware, fraud, or scam.\n"
+        "  - If evidence is weak or ambiguous, return clean with confidence below 0.60 instead of guessing.\n"
+        "  - confidence must be a number from 0.0 to 1.0 reflecting evidence strength.\n\n"
+        "Return ONLY this raw JSON object shape, with no markdown and no extra text:\n"
+        '{"flagged": false, "category": "clean", "reason": "brief evidence-based reason", "confidence": 0.0}'
     )
 
     user_msg = f"Confession to analyze:\n\n{content}{url_block}"
@@ -501,7 +538,21 @@ async def run_ai_filter(content: str, url_reputation: list = None) -> dict:
         raw = raw.strip()
 
         result = json.loads(raw)
-        result["flagged"] = str(result.get("flagged", False)).lower() == "true"
+        category = str(result.get("category", "clean")).lower().strip()
+        if category not in {"clean", "ad", "phishing", "spam"}:
+            category = "clean"
+        if category == "spam":
+            category = "ad"
+        try:
+            confidence = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        result["category"] = category
+        result["confidence"] = confidence
+        result["flagged"] = (
+            str(result.get("flagged", False)).lower() == "true"
+            and category in {"ad", "phishing"}
+        )
         return result
 
     except json.JSONDecodeError:
@@ -528,17 +579,20 @@ async def apply_filter(
     Returns True  → confession is pending admin review (caller ends conversation).
     Returns False → message is clean / filter is off (caller should proceed).
     """
-    if not FILTER_ENABLED or not content or content == "(voice message)":
+    if not content or content == "(voice message)":
+        return False
+
+    urls = extract_urls(content)
+    blocklisted = is_blocklisted(urls)
+    if not FILTER_ENABLED and not blocklisted:
         return False
 
     checking_msg = await update.message.reply_text(
         "🔍 _Scanning your confession…_", parse_mode="Markdown"
     )
 
-    urls = extract_urls(content)
-
     # ── Fast blocklist check — no AI cost, instant result ─────────────────
-    if is_blocklisted(urls):
+    if blocklisted:
         await checking_msg.delete()
         category   = "ad"
         confidence = 1.0
@@ -560,6 +614,7 @@ async def apply_filter(
             "reason":             reason,
             "content":            content,
             "timestamp":          timestamp,
+            "status":             STATUS_PENDING_APPROVAL,
         }
         save_pending_reviews(pending_reviews)
 
@@ -608,9 +663,27 @@ async def apply_filter(
             "reason":     reason,
             "confidence": confidence,
             "content":    content,
-            "status":     "pending_review",
+            "status":     STATUS_PENDING_APPROVAL,
             "review_id":  review_id,
             "method":     "blocklist",
+        })
+
+        append_log({
+            "number":     None,
+            "timestamp":  timestamp,
+            "post_type":  None,
+            "user_id":    user.id,
+            "full_name":  user.full_name,
+            "username":   username_str,
+            "content":    content,
+            "status":     STATUS_PENDING_APPROVAL,
+            "review_id":  review_id,
+            "moderation": {
+                "category": category,
+                "confidence": confidence,
+                "reason": reason,
+                "method": "blocklist",
+            },
         })
 
         await update.message.reply_text(
@@ -657,6 +730,7 @@ async def apply_filter(
         "reason":             reason,
         "content":            content,
         "timestamp":          timestamp,
+        "status":             STATUS_PENDING_APPROVAL,
     }
     save_pending_reviews(pending_reviews)
 
@@ -697,7 +771,7 @@ async def apply_filter(
         except Exception as exc:
             logger.warning("Failed to send review request to admin: %s", exc)
 
-    # ── Log as pending_review (status field added for filter_stats) ────────
+    # ── Log as pending_approval (status field added for filter_stats) ──────
     append_filter_log({
         "timestamp":  timestamp,
         "user_id":    user.id,
@@ -707,8 +781,26 @@ async def apply_filter(
         "reason":     reason,
         "confidence": confidence,
         "content":    content,
-        "status":     "pending_review",   # was "blocked" in previous version
+        "status":     STATUS_PENDING_APPROVAL,
         "review_id":  review_id,
+    })
+
+    append_log({
+        "number":     None,
+        "timestamp":  timestamp,
+        "post_type":  None,
+        "user_id":    user.id,
+        "full_name":  user.full_name,
+        "username":   username_str,
+        "content":    content,
+        "status":     STATUS_PENDING_APPROVAL,
+        "review_id":  review_id,
+        "moderation": {
+            "category": category,
+            "confidence": confidence,
+            "reason": reason,
+            "method": "ai",
+        },
     })
 
     # ── Tell the user their confession is under review ─────────────────────
@@ -735,6 +827,12 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         rev_rej_<12-hex>    → reject (notify user, discard confession)
     """
     query = update.callback_query
+    admin_user = update.effective_user
+
+    if not admin_user or not is_admin(admin_user.id):
+        await query.answer("Admins only.", show_alert=True)
+        return
+
     await query.answer()
 
     data = query.data
@@ -793,6 +891,16 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as exc:
             logger.warning("Could not edit review card after rejection: %s", exc)
 
+        update_log_by_review_id(review_id, {
+            "status": STATUS_REJECTED,
+            "rejected_at": timestamp,
+            "rejected_by": admin_user.id if admin_user else None,
+        })
+        update_filter_log_by_review_id(review_id, {
+            "status": STATUS_REJECTED,
+            "reviewed_at": timestamp,
+            "reviewed_by": admin_user.id if admin_user else None,
+        })
         logger.info("Admin REJECTED review_id=%s (user_id=%d)", review_id, review["user_id"])
         return
 
@@ -862,8 +970,8 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as exc:
             logger.warning("Could not DM approval to user: %s", exc)
 
-        # Log to confessions_log.json (same format as normal confessions)
-        append_log({
+        # Update the pending database/log row instead of creating a duplicate.
+        saved = update_log_by_review_id(review_id, {
             "number":    confession_count,
             "timestamp": timestamp,
             "post_type": post_type,
@@ -871,10 +979,37 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             "full_name": review["full_name"],
             "username":  review["username_str"],
             "content":   content,
+            "status":    STATUS_PUBLISHED,
+            "approved_at": timestamp,
+            "approved_by": admin_user.id if admin_user else None,
             "note":      (
                 f"admin-approved after AI flagged as {review['category']} "
                 f"({review['confidence']:.0%} confidence)"
             ),
+        })
+        if not saved:
+            append_log({
+                "number":    confession_count,
+                "timestamp": timestamp,
+                "post_type": post_type,
+                "user_id":   review["user_id"],
+                "full_name": review["full_name"],
+                "username":  review["username_str"],
+                "content":   content,
+                "status":    STATUS_PUBLISHED,
+                "review_id": review_id,
+                "approved_at": timestamp,
+                "approved_by": admin_user.id if admin_user else None,
+                "note":      (
+                    f"admin-approved after AI flagged as {review['category']} "
+                    f"({review['confidence']:.0%} confidence)"
+                ),
+            })
+        update_filter_log_by_review_id(review_id, {
+            "status": STATUS_PUBLISHED,
+            "reviewed_at": timestamp,
+            "reviewed_by": admin_user.id if admin_user else None,
+            "posted_number": confession_count,
         })
 
         # Update the review card in admin chat (removes buttons, appends status)
@@ -896,6 +1031,8 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Roll back the counter if posting failed
         logger.error("Failed to post admin-approved confession: %s", exc)
         decr_count()
+        pending_reviews[review_id] = review
+        save_pending_reviews(pending_reviews)
         try:
             await query.edit_message_text(
                 original_text
@@ -968,6 +1105,8 @@ async def receive_confession(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ─── Handle button click ──────────────────────────────────────────────────────
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    global confession_count
+
     query = update.callback_query
     await query.answer()
 
@@ -983,14 +1122,13 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     # ── Build label shown in channel ───────────────────────────────────────
     is_anonymous = (choice == "post_anonymous")
+    confession_count = incr_count()
 
     if is_anonymous:
-        author_label = f"🤫 *Anonymous Confession #{confession_count + 1}*"
+        author_label = f"🤫 *Anonymous Confession #{confession_count}*"
     else:
         display_name = f"@{user.username}" if user.username else user.full_name
-        author_label = f"👤 *Confession #{confession_count + 1} by {display_name}*"
-
-    confession_count = incr_count()
+        author_label = f"👤 *Confession #{confession_count} by {display_name}*"
 
     msg_type = ud.get("type")
     content  = ud.get("content", "")
@@ -1037,20 +1175,23 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         post_type    = "Anonymous" if is_anonymous else "Public"
 
         if ADMIN_CHAT_ID:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=(
-                    f"🔔 *New Confession #{confession_count}* ({post_type})\n"
-                    f"{'━' * 28}\n"
-                    f"👤 Name: {user.full_name}\n"
-                    f"🔗 Username: {username_str}\n"
-                    f"🆔 User ID: `{user.id}`\n"
-                    f"🕐 Time: {timestamp}\n"
-                    f"{'━' * 28}\n"
-                    f"📝 Content:\n{content}"
-                ),
-                parse_mode="Markdown",
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        f"🔔 *New Confession #{confession_count}* ({post_type})\n"
+                        f"{'━' * 28}\n"
+                        f"👤 Name: {user.full_name}\n"
+                        f"🔗 Username: {username_str}\n"
+                        f"🆔 User ID: `{user.id}`\n"
+                        f"🕐 Time: {timestamp}\n"
+                        f"{'━' * 28}\n"
+                        f"📝 Content:\n{content}"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as exc:
+                logger.warning("Failed to send admin notification for confession #%d: %s", confession_count, exc)
 
         # ── Save to log ────────────────────────────────────────────────────
         append_log({
@@ -1061,6 +1202,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             "full_name": user.full_name,
             "username":  username_str,
             "content":   content,
+            "status":    STATUS_PUBLISHED,
         })
 
         # ── Confirm to user ────────────────────────────────────────────────
@@ -1211,8 +1353,8 @@ def main() -> None:
 
     if not FILTER_ENABLED:
         logger.warning(
-            "AI filter is DISABLED — set GROQ_API_KEY to enable filtering, "
-            "admin review workflow, and Chinese auto-translation."
+            "Groq AI filter is DISABLED — set GROQ_API_KEY to enable AI moderation "
+            "and Chinese auto-translation. Blocklisted domains still go to admin review."
         )
     else:
         serper_status = (
