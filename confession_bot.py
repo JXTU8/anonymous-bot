@@ -896,9 +896,9 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as exc:
         # Roll back the counter if posting failed
+        global confession_count
         logger.error("Failed to post admin-approved confession: %s", exc)
         decr_count()
-        global confession_count
         confession_count = load_count()
         try:
             await query.edit_message_text(
@@ -1081,9 +1081,9 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
 
     except Exception as exc:
+        global confession_count
         logger.error("Failed to post confession #%d: %s", confession_count, exc)
         decr_count()
-        global confession_count
         confession_count = load_count()
         await query.edit_message_text(
             "❌ Couldn't post your confession.\n"
