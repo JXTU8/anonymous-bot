@@ -1,0 +1,14 @@
+# Secrets — NEVER commit this
+.env
+
+# Bot data files
+confession_count.json
+confessions_log.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
