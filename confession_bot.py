@@ -55,6 +55,12 @@ STATUS_REJECTED = "rejected"
 # ─── Redis keys ───────────────────────────────────────────────────────────────
 REDIS_COUNT_KEY   = "confession:count"
 REDIS_PENDING_KEY = "confession:pending_reviews"
+REDIS_LOG_KEY     = "confession:log"
+REDIS_FILTER_KEY  = "confession:filter_log"
+REDIS_DOMAINS_KEY = "confession:custom_block_domains"
+
+RATE_LIMIT_SECONDS = 45
+TELEGRAM_CAPTION_LIMIT = 1024
 
 # ─── Groq client (optional — features silently degrade without it) ────────────
 try:
@@ -68,6 +74,8 @@ FILTER_ENABLED = bool(groq_client)
 # ─── Conversation states ──────────────────────────────────────────────────────
 WAITING_CONFESSION = 1
 WAITING_CHOICE     = 2
+
+last_submit_at: dict[int, datetime] = {}
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -194,19 +202,42 @@ def save_pending_reviews(data: dict) -> None:
     redis_set(REDIS_PENDING_KEY, json.dumps(data, ensure_ascii=False))
 
 
-# ─── Log file helpers (kept as-is — logs are append-only, Redis not needed) ───
-def load_log() -> list:
+def load_json_list(key: str, file_path: str) -> list:
+    raw = redis_get(key)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Could not decode Redis list for key=%s", key)
     try:
-        with open(LOG_FILE) as f:
+        with open(file_path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
+
+def save_json_list(key: str, file_path: str, data: list) -> None:
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    redis_set(key, payload)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(payload)
+
+
+def load_log() -> list:
+    return load_json_list(REDIS_LOG_KEY, LOG_FILE)
+
+
+def save_log(log: list) -> None:
+    save_json_list(REDIS_LOG_KEY, LOG_FILE, log)
+
+
 def append_log(entry: dict) -> None:
     log = load_log()
     log.append(entry)
-    with open(LOG_FILE, "w") as f:
-        json.dump(log, f, ensure_ascii=False, indent=2)
+    save_log(log)
+
 
 def update_log_by_review_id(review_id: str, updates: dict) -> bool:
     log = load_log()
@@ -217,22 +248,23 @@ def update_log_by_review_id(review_id: str, updates: dict) -> bool:
             changed = True
             break
     if changed:
-        with open(LOG_FILE, "w") as f:
-            json.dump(log, f, ensure_ascii=False, indent=2)
+        save_log(log)
     return changed
 
+
 def load_filter_log() -> list:
-    try:
-        with open(FILTER_LOG) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    return load_json_list(REDIS_FILTER_KEY, FILTER_LOG)
+
+
+def save_filter_log(log: list) -> None:
+    save_json_list(REDIS_FILTER_KEY, FILTER_LOG, log)
+
 
 def append_filter_log(entry: dict) -> None:
     log = load_filter_log()
     log.append(entry)
-    with open(FILTER_LOG, "w") as f:
-        json.dump(log, f, ensure_ascii=False, indent=2)
+    save_filter_log(log)
+
 
 def update_filter_log_by_review_id(review_id: str, updates: dict) -> bool:
     log = load_filter_log()
@@ -243,9 +275,121 @@ def update_filter_log_by_review_id(review_id: str, updates: dict) -> bool:
             changed = True
             break
     if changed:
-        with open(FILTER_LOG, "w") as f:
-            json.dump(log, f, ensure_ascii=False, indent=2)
+        save_filter_log(log)
     return changed
+
+
+def load_custom_block_domains() -> set[str]:
+    raw = redis_get(REDIS_DOMAINS_KEY)
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw)
+        return {normalize_domain(d) for d in data if normalize_domain(d)}
+    except (json.JSONDecodeError, TypeError):
+        return set()
+
+
+def save_custom_block_domains(domains: set[str]) -> None:
+    redis_set(REDIS_DOMAINS_KEY, json.dumps(sorted(domains), ensure_ascii=False))
+
+
+def active_ad_domains() -> set[str]:
+    return set(AD_DOMAINS) | load_custom_block_domains()
+
+
+def normalize_domain(domain: str) -> str:
+    domain = domain.strip().lower()
+    domain = re.sub(r"^https?://", "", domain)
+    domain = domain.split("/", 1)[0].split("?", 1)[0].strip(".")
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def shorten(text: str, limit: int = 3500) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20] + "\n...[truncated]"
+
+
+def safe_preview(text: str, limit: int = 120) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+async def post_to_group(
+    context: ContextTypes.DEFAULT_TYPE,
+    msg_type: str,
+    author_label: str,
+    content: str,
+    file_id: str = "",
+) -> None:
+    text = f"{author_label}\n\n{content}".strip()
+    if msg_type == "text":
+        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
+    elif msg_type == "photo":
+        if len(text) <= TELEGRAM_CAPTION_LIMIT:
+            await context.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=file_id, caption=text)
+        else:
+            await context.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=file_id, caption=author_label)
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=content)
+    elif msg_type == "video":
+        if len(text) <= TELEGRAM_CAPTION_LIMIT:
+            await context.bot.send_video(chat_id=GROUP_CHAT_ID, video=file_id, caption=text)
+        else:
+            await context.bot.send_video(chat_id=GROUP_CHAT_ID, video=file_id, caption=author_label)
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=content)
+    elif msg_type == "voice":
+        await context.bot.send_voice(chat_id=GROUP_CHAT_ID, voice=file_id, caption=author_label)
+    else:
+        raise ValueError(f"Unsupported message type: {msg_type}")
+
+
+def is_rate_limited(user_id: int) -> int:
+    now = datetime.now()
+    last = last_submit_at.get(user_id)
+    if not last:
+        return 0
+    elapsed = (now - last).total_seconds()
+    remaining = int(RATE_LIMIT_SECONDS - elapsed)
+    return max(0, remaining)
+
+
+def mark_submit(user_id: int) -> None:
+    last_submit_at[user_id] = datetime.now()
+
+
+def find_record(record_id: str) -> dict | None:
+    if record_id in pending_reviews:
+        r = dict(pending_reviews[record_id])
+        r["review_id"] = record_id
+        return r
+    for entry in reversed(load_log()):
+        if str(entry.get("review_id")) == record_id or str(entry.get("number")) == record_id:
+            return entry
+    return None
+
+
+def format_record(entry: dict) -> str:
+    moderation = entry.get("moderation") or {}
+    lines = [
+        f"Status: {entry.get('status', 'unknown')}",
+        f"Review ID: {entry.get('review_id', '-')}",
+        f"Number: {entry.get('number', '-')}",
+        f"Type: {entry.get('post_type', '-')}",
+        f"Name: {entry.get('full_name', '?')}",
+        f"Username: {entry.get('username') or entry.get('username_str', '?')}",
+        f"User ID: {entry.get('user_id', '?')}",
+        f"Time: {entry.get('timestamp', '?')}",
+    ]
+    if moderation:
+        lines += [
+            f"Moderation: {moderation.get('category', '?')} ({moderation.get('confidence', 0):.0%})",
+            f"Reason: {moderation.get('reason', '?')}",
+        ]
+    lines.append(f"Content:\n{entry.get('content', '(media)')}")
+    return "\n".join(lines)
 
 confession_count = 0  # loaded from Redis in main() — do not use before that
 
@@ -296,8 +440,11 @@ def extract_urls(text: str) -> list:
     explicit = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', text)
 
     # Bare known-ad domains without protocol (e.g. "xhslink.com/abc123")
-    bare_pattern = r'\b(?:' + '|'.join(re.escape(d) for d in AD_DOMAINS) + r')[^\s]*'
-    bare = re.findall(bare_pattern, text, re.IGNORECASE)
+    domains = active_ad_domains()
+    bare = []
+    if domains:
+        bare_pattern = r'\b(?:' + '|'.join(re.escape(d) for d in domains) + r')[^\s]*'
+        bare = re.findall(bare_pattern, text, re.IGNORECASE)
 
     # Deduplicate while preserving order
     seen = set()
@@ -319,8 +466,8 @@ def is_blocklisted(urls: list) -> bool:
         m = re.search(r'(?:https?://)?([^/\s?#]+)', url, re.IGNORECASE)
         if not m:
             continue
-        domain = m.group(1).lower().lstrip("www.")
-        for ad_domain in AD_DOMAINS:
+        domain = normalize_domain(m.group(1))
+        for ad_domain in active_ad_domains():
             if domain == ad_domain or domain.endswith("." + ad_domain):
                 logger.info("Blocklist hit: domain=%s matched rule=%s", domain, ad_domain)
                 return True
@@ -329,19 +476,30 @@ def is_blocklisted(urls: list) -> bool:
 # ─── NEW Feature 2 helpers: Chinese detection & translation ───────────────────
 def has_chinese(text: str) -> bool:
     """
-    Return True if the text contains any CJK (Chinese) characters.
-    Covers the three most common Unicode blocks:
+    Return True if the text contains Chinese characters BUT is not primarily Japanese.
+    - Detects CJK Unified Ideographs (shared by Chinese, Japanese, Korean)
+    - Excludes text that also contains Hiragana/Katakana (Japanese scripts)
+      so that Japanese messages are NOT mistakenly sent for translation.
+    Covers the three most common Unicode blocks for Chinese:
       - CJK Unified Ideographs       U+4E00–U+9FFF  (most common Chinese chars)
       - CJK Extension A               U+3400–U+4DBF
       - CJK Compatibility Ideographs  U+F900–U+FAFF
     """
-    return bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]', text))
+    has_cjk = bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]', text))
+    if not has_cjk:
+        return False
+    # If the text contains Hiragana or Katakana, it's Japanese — skip translation
+    has_japanese = bool(re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text))
+    return not has_japanese
 
 
 async def translate_chinese(text: str) -> str | None:
     """
-    Translate text containing Chinese characters into English using Groq
+    Translate ONLY Chinese text into English using Groq
     (llama-3.3-70b-versatile, same model already used for moderation).
+
+    - Translates only the Chinese portions; non-Chinese text is left as-is.
+    - Does NOT translate any other language (Japanese, Korean, Arabic, etc.).
 
     Returns the English translation string, or None if Groq is unavailable
     or the API call fails. Caller should handle None gracefully.
@@ -356,10 +514,11 @@ async def translate_chinese(text: str) -> str | None:
                 {
                     "role": "system",
                     "content": (
-                        "You are a professional translator. "
-                        "Translate the following text to English. "
-                        "Output ONLY the English translation — "
-                        "no preamble, no explanations, no quotes."
+                        "You are a professional Chinese-to-English translator. "
+                        "Translate ONLY the Chinese (Mandarin or Cantonese) portions of the text below into English. "
+                        "If the message mixes Chinese and English, translate only the Chinese parts and keep any English parts unchanged. "
+                        "Do NOT translate any other language (Japanese, Korean, Arabic, Malay, etc.) — leave them as-is. "
+                        "Output ONLY the translated result — no preamble, no explanations, no quotes."
                     ),
                 },
                 {"role": "user", "content": text},
@@ -402,12 +561,11 @@ async def post_translation(
         await context.bot.send_message(
             chat_id=GROUP_CHAT_ID,
             text=(
-                f"🌏 *Auto-Translation — Confession #{confession_num}*\n"
+                f"🌏 Auto-Translation — Confession #{confession_num}\n"
                 f"{'━' * 28}\n"
-                f"🇨🇳 *Original:*\n{content}\n\n"
-                f"🇬🇧 *English:*\n{translation}"
+                f"🇨🇳 Original:\n{content}\n\n"
+                f"🇬🇧 English:\n{translation}"
             ),
-            parse_mode="Markdown",
         )
         logger.info("Auto-translated Confession #%d (Chinese → English)", confession_num)
     except Exception as exc:
@@ -923,29 +1081,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         # Post to channel
-        if msg_type == "text":
-            await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=f"{author_label}\n\n{content}",
-            )
-        elif msg_type == "photo":
-            await context.bot.send_photo(
-                chat_id=GROUP_CHAT_ID,
-                photo=file_id,
-                caption=f"{author_label}\n\n{content}",
-            )
-        elif msg_type == "video":
-            await context.bot.send_video(
-                chat_id=GROUP_CHAT_ID,
-                video=file_id,
-                caption=f"{author_label}\n\n{content}",
-            )
-        elif msg_type == "voice":
-            await context.bot.send_voice(
-                chat_id=GROUP_CHAT_ID,
-                voice=file_id,
-                caption=author_label,
-            )
+        await post_to_group(context, msg_type, author_label, content, file_id)
 
         # ── Feature 2: auto-translate Chinese content (if any) ────────────
         await post_translation(context, content, confession_count)
@@ -1020,7 +1156,6 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
     except Exception as exc:
-        # Roll back the counter if posting failed
         logger.error("Failed to post admin-approved confession: %s", exc)
         decr_count()
         pending_reviews[review_id] = review
@@ -1028,7 +1163,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await query.edit_message_text(
                 original_text
-                + "\n\n⚠️ Post failed. Make sure your message doesn't include advertisement.",
+                + "\n\n⚠️ Post failed. This item was returned to pending review. Check bot logs for the exact Telegram error.",
             )
         except Exception:
             pass
@@ -1040,7 +1175,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "🤫 *Confession Bot*\n\n"
         "Go ahead — type your confession now 👇\n\n"
-        "_You can send text, a photo, video, or voice message._",
+        "_You can send text, a photo, video, or voice message._\n\n"
+        "Type /cancel at any time to cancel.",
         parse_mode="Markdown",
     )
     return WAITING_CONFESSION
@@ -1049,23 +1185,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def receive_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.message
     ud  = context.user_data
+    user = update.effective_user
+
+    remaining = is_rate_limited(user.id)
+    if remaining:
+        await update.message.reply_text(
+            f"Please wait {remaining}s before sending another confession."
+        )
+        return WAITING_CONFESSION
 
     if msg.text:
         ud["type"]    = "text"
         ud["content"] = msg.text
-        preview       = msg.text[:120] + ("..." if len(msg.text) > 120 else "")
+        preview       = safe_preview(msg.text)
 
     elif msg.photo:
         ud["type"]    = "photo"
         ud["file_id"] = msg.photo[-1].file_id
         ud["content"] = msg.caption or ""
-        preview       = "📷 Photo" + (f": {msg.caption}" if msg.caption else "")
+        preview       = "📷 Photo" + (f": {safe_preview(msg.caption)}" if msg.caption else "")
 
     elif msg.video:
         ud["type"]    = "video"
         ud["file_id"] = msg.video.file_id
         ud["content"] = msg.caption or ""
-        preview       = "🎥 Video" + (f": {msg.caption}" if msg.caption else "")
+        preview       = "🎥 Video" + (f": {safe_preview(msg.caption)}" if msg.caption else "")
 
     elif msg.voice:
         ud["type"]    = "voice"
@@ -1083,15 +1227,16 @@ async def receive_confession(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # ── AI Filter (skips voice — no text to analyze) ───────────────────────
     blocked = await apply_filter(update, context, ud.get("content", ""))
     if blocked:
+        mark_submit(user.id)
         return ConversationHandler.END
 
     # ── All clear — show posting options ───────────────────────────────────
     await update.message.reply_text(
-        f"📝 *Your confession:*\n_{preview}_\n\n"
+        f"📝 Your confession:\n{preview}\n\n"
         "How do you want to post this?",
         reply_markup=choice_keyboard(),
-        parse_mode="Markdown",
     )
+    mark_submit(user.id)
     return WAITING_CHOICE
 
 # ─── Handle button click ──────────────────────────────────────────────────────
@@ -1127,29 +1272,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     try:
         # ── Post to channel ────────────────────────────────────────────────
-        if msg_type == "text":
-            await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=f"{author_label}\n\n{content}",
-            )
-        elif msg_type == "photo":
-            await context.bot.send_photo(
-                chat_id=GROUP_CHAT_ID,
-                photo=file_id,
-                caption=f"{author_label}\n\n{content}",
-            )
-        elif msg_type == "video":
-            await context.bot.send_video(
-                chat_id=GROUP_CHAT_ID,
-                video=file_id,
-                caption=f"{author_label}\n\n{content}",
-            )
-        elif msg_type == "voice":
-            await context.bot.send_voice(
-                chat_id=GROUP_CHAT_ID,
-                voice=file_id,
-                caption=author_label,
-            )
+        await post_to_group(context, msg_type, author_label, content, file_id)
 
         # ── Feature 2: Auto-translate Chinese content ──────────────────────
         # Runs right after posting. If content has no Chinese, or Groq is
@@ -1207,7 +1330,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         decr_count()
         await query.edit_message_text(
             "❌ Couldn't post your confession.\n"
-            "Make sure your message doesn't include advertisement."
+            "The item was not published. Please try again later."
         )
 
     context.user_data.clear()
@@ -1253,16 +1376,16 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        f"🔍 *Confession #{target} — Sender Info*\n"
+        f"🔍 Confession #{target} — Sender Info\n"
         f"{'━' * 28}\n"
         f"📌 Type: {entry.get('post_type', '?')}\n"
         f"👤 Name: {entry.get('full_name', '?')}\n"
         f"🔗 Username: {entry.get('username', '?')}\n"
-        f"🆔 User ID: `{entry.get('user_id', '?')}`\n"
+        f"🆔 User ID: {entry.get('user_id', '?')}\n"
         f"🕐 Sent at: {entry.get('timestamp', '?')}\n"
+        f"Status: {entry.get('status', 'unknown')}\n"
         f"{'━' * 28}\n"
         f"📝 Content:\n{entry.get('content', '(media)')}",
-        parse_mode="Markdown",
     )
 
 # ─── Admin: /filter_stats ─────────────────────────────────────────────────────
@@ -1319,16 +1442,16 @@ async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("✅ No confessions are pending review right now.")
         return
 
-    lines = [f"⏳ *Pending Reviews ({len(pending_reviews)})*", f"{'━' * 28}"]
+    lines = [f"⏳ Pending Reviews ({len(pending_reviews)})", f"{'━' * 28}"]
     for rid, r in pending_reviews.items():
         cat_label = CATEGORY_LABELS.get(r["category"], r["category"])
         lines.append(
-            f"🆔 `{rid}` | {r['full_name']} | {cat_label} | {r['timestamp']}"
+            f"🆔 {rid} | {r['full_name']} | {cat_label} | {r['timestamp']}"
         )
     lines.append(f"\n{'━' * 28}")
     lines.append("Use /review <id> to resend the approval buttons for a pending confession.")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def resend_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
