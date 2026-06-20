@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Telegram Anonymous Confession Bot
-- User must /start every time to send a confession
-- After typing, two buttons appear: Post Anonymously / Post Publicly
-- Admin always gets a silent DM with full sender identity
+Telegram Anonymous Q&A Bot (for classroom use)
+- Students /start to ask a question, anonymously or publicly
+- After typing, buttons appear: Post Anonymously / Post Publicly / Edit / Cancel
+- Teacher (admin) always gets a silent DM with full asker identity
 - AI filter (Groq llama-3.3-70b + Serper) queues high-risk messages for
   admin review — never auto-deletes
-- Chinese text in confessions is auto-translated to English in the channel
-- Confession count persisted in Upstash Redis (survives bot restarts)
-- Pending reviews persisted in Upstash Redis (survives bot restarts)
+- Students can anonymously upvote questions in the group
+- Teacher answers by copy-pasting the question into the group as a reply —
+  no bot command needed for this
+- /ask <#> <text> sends the asker an anonymous DM requesting clarification;
+  their reply is relayed back to the teacher
+- Question count, votes, and pending reviews persisted in Upstash Redis
+  (survive bot restarts)
 """
 
 import asyncio
@@ -30,6 +34,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
+    ApplicationHandlerStop,
     filters,
     ContextTypes,
 )
@@ -58,8 +63,11 @@ REDIS_PENDING_KEY = "confession:pending_reviews"
 REDIS_LOG_KEY     = "confession:log"
 REDIS_FILTER_KEY  = "confession:filter_log"
 REDIS_DOMAINS_KEY = "confession:custom_block_domains"
+REDIS_BANNED_KEY  = "confession:banned_users"
+REDIS_VOTES_PREFIX = "confession:votes:"
+REDIS_CLARIFY_KEY  = "confession:awaiting_clarification"
 
-RATE_LIMIT_SECONDS = 45
+RATE_LIMIT_SECONDS = 5
 TELEGRAM_CAPTION_LIMIT = 1024
 
 # ─── Groq client (optional — features silently degrade without it) ────────────
@@ -89,7 +97,7 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def home():
-    return "Confession bot is running! 🤫", 200
+    return "Q&A bot is running! 📚", 200
 
 @flask_app.route("/health")
 def health():
@@ -294,6 +302,58 @@ def save_custom_block_domains(domains: set[str]) -> None:
     redis_set(REDIS_DOMAINS_KEY, json.dumps(sorted(domains), ensure_ascii=False))
 
 
+def load_banned_users() -> set:
+    """Load the set of banned user IDs from Redis."""
+    raw = redis_get(REDIS_BANNED_KEY)
+    if not raw:
+        return set()
+    try:
+        return set(int(uid) for uid in json.loads(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return set()
+
+
+def save_banned_users(banned: set) -> None:
+    """Persist the banned user IDs set to Redis."""
+    redis_set(REDIS_BANNED_KEY, json.dumps(sorted(banned), ensure_ascii=False))
+
+
+# ─── Upvotes (Redis-backed, one key per question number) ────────────────────
+def load_votes(number: int) -> dict:
+    """Load {'count': int, 'voters': [user_id, ...]} for a question. Defaults to empty."""
+    raw = redis_get(f"{REDIS_VOTES_PREFIX}{number}")
+    if not raw:
+        return {"count": 0, "voters": []}
+    try:
+        data = json.loads(raw)
+        voters = [int(v) for v in data.get("voters", [])]
+        return {"count": len(voters), "voters": voters}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {"count": 0, "voters": []}
+
+
+def save_votes(number: int, data: dict) -> None:
+    """Persist vote data for a question."""
+    redis_set(f"{REDIS_VOTES_PREFIX}{number}", json.dumps(data, ensure_ascii=False))
+
+
+# ─── Pending clarification requests (Redis-backed) ───────────────────────────
+# Maps user_id -> question number the admin is asking them to clarify.
+# Consumed by handle_clarification_reply when the student replies.
+def load_awaiting_clarification() -> dict:
+    raw = redis_get(REDIS_CLARIFY_KEY)
+    if not raw:
+        return {}
+    try:
+        return {int(k): int(v) for k, v in json.loads(raw).items()}
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        return {}
+
+
+def save_awaiting_clarification(data: dict) -> None:
+    redis_set(REDIS_CLARIFY_KEY, json.dumps({str(k): v for k, v in data.items()}, ensure_ascii=False))
+
+
 def active_ad_domains() -> set[str]:
     return set(AD_DOMAINS) | load_custom_block_domains()
 
@@ -324,24 +384,39 @@ async def post_to_group(
     author_label: str,
     content: str,
     file_id: str = "",
-) -> None:
+    reply_markup=None,
+) -> tuple[int, int | None]:
+    """
+    Post a question to the group channel.
+    Returns (primary_message_id, secondary_message_id_or_None).
+    For photo/video that exceed the caption limit, two messages are sent —
+    both IDs are returned so /delete can remove both.
+    reply_markup (if given) is attached to the primary message only — this
+    is how the 👍 upvote button gets attached to new questions.
+    """
     text = f"{author_label}\n\n{content}".strip()
     if msg_type == "text":
-        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
+        msg = await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, reply_markup=reply_markup)
+        return msg.message_id, None
     elif msg_type == "photo":
         if len(text) <= TELEGRAM_CAPTION_LIMIT:
-            await context.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=file_id, caption=text)
+            msg = await context.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=file_id, caption=text, reply_markup=reply_markup)
+            return msg.message_id, None
         else:
-            await context.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=file_id, caption=author_label)
-            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=content)
+            msg  = await context.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=file_id, caption=author_label, reply_markup=reply_markup)
+            msg2 = await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=content)
+            return msg.message_id, msg2.message_id
     elif msg_type == "video":
         if len(text) <= TELEGRAM_CAPTION_LIMIT:
-            await context.bot.send_video(chat_id=GROUP_CHAT_ID, video=file_id, caption=text)
+            msg = await context.bot.send_video(chat_id=GROUP_CHAT_ID, video=file_id, caption=text, reply_markup=reply_markup)
+            return msg.message_id, None
         else:
-            await context.bot.send_video(chat_id=GROUP_CHAT_ID, video=file_id, caption=author_label)
-            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=content)
+            msg  = await context.bot.send_video(chat_id=GROUP_CHAT_ID, video=file_id, caption=author_label, reply_markup=reply_markup)
+            msg2 = await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=content)
+            return msg.message_id, msg2.message_id
     elif msg_type == "voice":
-        await context.bot.send_voice(chat_id=GROUP_CHAT_ID, voice=file_id, caption=author_label)
+        msg = await context.bot.send_voice(chat_id=GROUP_CHAT_ID, voice=file_id, caption=author_label, reply_markup=reply_markup)
+        return msg.message_id, None
     else:
         raise ValueError(f"Unsupported message type: {msg_type}")
 
@@ -397,9 +472,18 @@ confession_count = 0  # loaded from Redis in main() — do not use before that
 # Persisted to Redis after every change so reviews survive bot restarts.
 pending_reviews: dict = {}   # populated in main() after Redis is ready
 
+# ─── Banned users — loaded from Redis on startup ─────────────────────────────
+banned_users: set = set()    # populated in main() after Redis is ready
+
+# ─── Pending clarification requests — loaded from Redis on startup ──────────
+awaiting_clarification: dict = {}   # populated in main() after Redis is ready
+
 # ─── General helpers ──────────────────────────────────────────────────────────
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_CHAT_ID) and user_id == ADMIN_CHAT_ID
+
+def is_banned(user_id: int) -> bool:
+    return user_id in banned_users
 
 def choice_keyboard():
     return InlineKeyboardMarkup([
@@ -407,8 +491,19 @@ def choice_keyboard():
             InlineKeyboardButton("🤫 Post Anonymously", callback_data="post_anonymous"),
             InlineKeyboardButton("👤 Post Publicly",    callback_data="post_public"),
         ],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+        [
+            InlineKeyboardButton("✏️ Edit",   callback_data="edit_confession"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+        ],
     ])
+
+
+def voting_keyboard(number: int) -> InlineKeyboardMarkup:
+    """Build the 👍 upvote button shown under a posted question, with the live count."""
+    votes = load_votes(number)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"👍 Upvote ({votes['count']})", callback_data=f"upvote_{number}")
+    ]])
 
 # ─── Known ad/spam domains — checked instantly before AI ─────────────────────
 # Add any domain you keep seeing spammed in confessions.
@@ -473,105 +568,6 @@ def is_blocklisted(urls: list) -> bool:
                 return True
     return False
 
-# ─── NEW Feature 2 helpers: Chinese detection & translation ───────────────────
-def has_chinese(text: str) -> bool:
-    """
-    Return True if the text contains Chinese characters BUT is not primarily Japanese.
-    - Detects CJK Unified Ideographs (shared by Chinese, Japanese, Korean)
-    - Excludes text that also contains Hiragana/Katakana (Japanese scripts)
-      so that Japanese messages are NOT mistakenly sent for translation.
-    Covers the three most common Unicode blocks for Chinese:
-      - CJK Unified Ideographs       U+4E00–U+9FFF  (most common Chinese chars)
-      - CJK Extension A               U+3400–U+4DBF
-      - CJK Compatibility Ideographs  U+F900–U+FAFF
-    """
-    has_cjk = bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]', text))
-    if not has_cjk:
-        return False
-    # If the text contains Hiragana or Katakana, it's Japanese — skip translation
-    has_japanese = bool(re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text))
-    return not has_japanese
-
-
-async def translate_chinese(text: str) -> str | None:
-    """
-    Translate ONLY Chinese text into English using Groq
-    (llama-3.3-70b-versatile, same model already used for moderation).
-
-    - Translates only the Chinese portions; non-Chinese text is left as-is.
-    - Does NOT translate any other language (Japanese, Korean, Arabic, etc.).
-
-    Returns the English translation string, or None if Groq is unavailable
-    or the API call fails. Caller should handle None gracefully.
-    """
-    if not groq_client:
-        return None
-
-    def _call():
-        return groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a professional Chinese-to-English translator. "
-                        "Translate ONLY the Chinese (Mandarin or Cantonese) portions of the text below into English. "
-                        "If the message mixes Chinese and English, translate only the Chinese parts and keep any English parts unchanged. "
-                        "Do NOT translate any other language (Japanese, Korean, Arabic, Malay, etc.) — leave them as-is. "
-                        "Output ONLY the translated result — no preamble, no explanations, no quotes."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            max_tokens=500,
-        )
-
-    try:
-        resp = await asyncio.to_thread(_call)
-        return resp.choices[0].message.content.strip()
-    except Exception as exc:
-        logger.warning("Chinese translation failed: %s", exc)
-        return None
-
-
-async def post_translation(
-    context: ContextTypes.DEFAULT_TYPE,
-    content: str,
-    confession_num: int,
-) -> None:
-    """
-    If `content` contains Chinese characters, translate it and post a
-    bilingual follow-up message to the group channel immediately after
-    the confession.
-
-    Silently skips when:
-      - content is empty or voice-only  "(voice message)"
-      - no Chinese characters are found
-      - translation returns None (Groq unavailable / error)
-    """
-    if not content or not has_chinese(content):
-        return
-
-    translation = await translate_chinese(content)
-    if not translation:
-        return
-
-    try:
-        await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text=(
-                f"🌏 Auto-Translation — Confession #{confession_num}\n"
-                f"{'━' * 28}\n"
-                f"🇨🇳 Original:\n{content}\n\n"
-                f"🇬🇧 English:\n{translation}"
-            ),
-        )
-        logger.info("Auto-translated Confession #%d (Chinese → English)", confession_num)
-    except Exception as exc:
-        logger.warning("Failed to post translation message: %s", exc)
-
-
 # ─── AI Filter ────────────────────────────────────────────────────────────────
 CATEGORY_LABELS = {
     "ad":       "📢 Advertisement / Promo Spam",
@@ -628,12 +624,12 @@ async def check_urls_serper(urls: list) -> list:
 
 async def run_ai_filter(content: str, url_reputation: list = None) -> dict:
     """
-    Send confession text + optional URL reputation context to Groq for moderation.
+    Send question text + optional URL reputation context to Groq for moderation.
 
     Returns:
         {"flagged": bool, "category": str, "reason": str, "confidence": float}
 
-    Fails OPEN (returns clean) if the API is unavailable — confessions are never
+    Fails OPEN (returns clean) if the API is unavailable — questions are never
     silently lost due to a filter outage.
     """
     if not groq_client:
@@ -648,12 +644,12 @@ async def run_ai_filter(content: str, url_reputation: list = None) -> dict:
                 url_block += f"  • {snippet}\n"
 
     system_prompt = (
-        "You are a precision content-moderation classifier for a Telegram anonymous confession bot.\n\n"
-        "Your job is NOT to judge whether a confession is embarrassing, rude, emotional, sexual, sad, "
-        "or controversial. Personal confessions, secrets, rants, relationship stories, school/work drama, "
-        "and opinions are clean unless they are clearly ad spam or phishing/scam content.\n\n"
+        "You are a precision content-moderation classifier for a Telegram anonymous classroom Q&A bot.\n\n"
+        "Your job is NOT to judge whether a question is awkward, off-topic, or poorly phrased. "
+        "Student questions, even casual or unrelated ones, are clean unless they are clearly ad "
+        "spam or phishing/scam content.\n\n"
         "Allowed categories:\n"
-        "  clean: normal confession content, including casual brand mentions without promotion.\n"
+        "  clean: normal student question content, including casual brand mentions without promotion.\n"
         "  ad: unsolicited promotion, referral/affiliate spam, MLM recruitment, product/service selling, "
         "traffic-driving social/shop links, discount codes, repeated copy-paste marketing, or calls to DM/buy/join.\n"
         "  phishing: scam, malware, fake prize/job/investment offer, credential harvesting, financial fraud, "
@@ -672,7 +668,7 @@ async def run_ai_filter(content: str, url_reputation: list = None) -> dict:
         '{"flagged": false, "category": "clean", "reason": "brief evidence-based reason", "confidence": 0.0}'
     )
 
-    user_msg = f"Confession to analyze:\n\n{content}{url_block}"
+    user_msg = f"Question to analyze:\n\n{content}{url_block}"
 
     raw = ""
     def _call():
@@ -734,7 +730,7 @@ async def apply_filter(
       HIGH-RISK result → message is forwarded to admin for manual review.
       The bot no longer auto-deletes. Admin sees Approve / Reject buttons.
 
-    Returns True  → confession is pending admin review (caller ends conversation).
+    Returns True  → question is pending admin review (caller ends conversation).
     Returns False → message is clean / filter is off (caller should proceed).
     """
     if not content or content == "(voice message)":
@@ -746,7 +742,7 @@ async def apply_filter(
         return False
 
     checking_msg = await update.message.reply_text(
-        "🔍 _Scanning your confession…_", parse_mode="Markdown"
+        "🔍 _Scanning your question…_", parse_mode="Markdown"
     )
 
     # ── Fast blocklist check — no AI cost, instant result ─────────────────
@@ -804,7 +800,7 @@ async def apply_filter(
                         f"🤖 Reason:     {reason}\n"
                         f"📊 Confidence: 100% (blocklist)\n"
                         f"{'━' * 28}\n"
-                        f"📝 Content:\n{content}"
+                        f"📝 Question:\n{content}"
                     ),
                     reply_markup=review_keyboard,
                 )
@@ -844,9 +840,9 @@ async def apply_filter(
         })
 
         await update.message.reply_text(
-            "⏳ *Your confession is under admin review.*\n\n"
+            "⏳ *Your question is under admin review.*\n\n"
             "An admin will look at it shortly and you'll be notified of the outcome.\n"
-            "Type /start if you'd like to submit a different confession in the meantime.",
+            "Type /start if you'd like to submit a different question in the meantime.",
             parse_mode="Markdown",
         )
         context.user_data.clear()
@@ -910,7 +906,7 @@ async def apply_filter(
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=(
-                    f"⚠️ High-Risk Confession — Pending Your Review\n"
+                    f"⚠️ High-Risk Question — Pending Your Review\n"
                     f"{'━' * 28}\n"
                     f"👤 Name:       {user.full_name}\n"
                     f"🔗 Username:   {username_str}\n"
@@ -920,7 +916,7 @@ async def apply_filter(
                     f"🤖 AI Reason:  {reason}\n"
                     f"📊 Confidence: {confidence:.0%}\n"
                     f"{'━' * 28}\n"
-                    f"📝 Content:\n{content}"
+                    f"📝 Question:\n{content}"
                 ),
                 reply_markup=review_keyboard,
             )
@@ -959,11 +955,11 @@ async def apply_filter(
         },
     })
 
-    # ── Tell the user their confession is under review ─────────────────────
+    # ── Tell the user their question is under review ─────────────────────
     await update.message.reply_text(
-        "⏳ *Your confession is under admin review.*\n\n"
+        "⏳ *Your question is under admin review.*\n\n"
         "An admin will look at it shortly and you'll be notified of the outcome.\n"
-        "Type /start if you'd like to submit a different confession in the meantime.",
+        "Type /start if you'd like to submit a different question in the meantime.",
         parse_mode="Markdown",
     )
 
@@ -975,12 +971,12 @@ async def apply_filter(
 async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handles the admin pressing ✅ Approve (Anon/Public) or ❌ Reject on a
-    pending high-risk confession review card.
+    pending high-risk question review card.
 
     Callback data formats (all safely under Telegram's 64-byte limit):
         rev_anon_<12-hex>   → approve and post anonymously
         rev_pub_<12-hex>    → approve and post publicly
-        rev_rej_<12-hex>    → reject (notify user, discard confession)
+        rev_rej_<12-hex>    → reject (notify user, discard question)
     """
     query = update.callback_query
     admin_user = update.effective_user
@@ -1030,8 +1026,8 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_message(
                 chat_id=user_chat_id,
                 text=(
-                    "❌ *Your confession was reviewed and could not be approved.*\n\n"
-                    "Type /start if you'd like to submit a different confession."
+                    "❌ *Your question was reviewed and could not be approved.*\n\n"
+                    "Type /start if you'd like to submit a different question."
                 ),
                 parse_mode="Markdown",
             )
@@ -1065,15 +1061,15 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
     post_type = "Anonymous" if is_anonymous else "Public"
 
     if is_anonymous:
-        author_label = f"🤫 Anonymous Confession #{confession_count}"
+        author_label = f"🤫 Anonymous Question #{confession_count}"
     else:
-        # Use the stored username/name from when the confession was submitted
+        # Use the stored username/name from when the question was submitted
         display_name = (
             review["username_str"]
             if review["username_str"] != "no username"
             else review["full_name"]
         )
-        author_label = f"👤 Confession #{confession_count} by {display_name}"
+        author_label = f"👤 Question #{confession_count} by {display_name}"
 
     msg_type = ud.get("type")
     content  = ud.get("content", "")
@@ -1081,18 +1077,18 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         # Post to channel
-        await post_to_group(context, msg_type, author_label, content, file_id)
-
-        # ── Feature 2: auto-translate Chinese content (if any) ────────────
-        await post_translation(context, content, confession_count)
+        msg_id, msg_id_2 = await post_to_group(
+            context, msg_type, author_label, content, file_id,
+            reply_markup=voting_keyboard(confession_count),
+        )
 
         # DM the user with the approval news
         try:
             await context.bot.send_message(
                 chat_id=user_chat_id,
                 text=(
-                    f"✅ *Your confession #{confession_count} was approved and posted!*\n\n"
-                    "Type /start to send another confession."
+                    f"✅ *Your question #{confession_count} was approved and posted!*\n\n"
+                    "Type /start to send another question."
                 ),
                 parse_mode="Markdown",
             )
@@ -1111,6 +1107,10 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             "status":    STATUS_PUBLISHED,
             "approved_at": timestamp,
             "approved_by": admin_user.id if admin_user else None,
+            "message_id":  msg_id,
+            "msg_type":     msg_type,
+            "author_label": author_label,
+            **( {"message_id_2": msg_id_2} if msg_id_2 else {} ),
             "note":      (
                 f"admin-approved after AI flagged as {review['category']} "
                 f"({review['confidence']:.0%} confidence)"
@@ -1129,6 +1129,10 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "review_id": review_id,
                 "approved_at": timestamp,
                 "approved_by": admin_user.id if admin_user else None,
+                "message_id":  msg_id,
+                "msg_type":     msg_type,
+                "author_label": author_label,
+                **( {"message_id_2": msg_id_2} if msg_id_2 else {} ),
                 "note":      (
                     f"admin-approved after AI flagged as {review['category']} "
                     f"({review['confidence']:.0%} confidence)"
@@ -1145,18 +1149,18 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await query.edit_message_text(
                 original_text
-                + f"\n\n✅ Approved — posted as Confession #{confession_count} ({post_type}).",
+                + f"\n\n✅ Approved — posted as Question #{confession_count} ({post_type}).",
             )
         except Exception as exc:
             logger.warning("Could not edit review card after approval: %s", exc)
 
         logger.info(
-            "Admin APPROVED review_id=%s → Confession #%d | %s | user_id=%d",
+            "Admin APPROVED review_id=%s → Question #%d | %s | user_id=%d",
             review_id, confession_count, post_type, review["user_id"],
         )
 
     except Exception as exc:
-        logger.error("Failed to post admin-approved confession: %s", exc)
+        logger.error("Failed to post admin-approved question: %s", exc)
         decr_count()
         pending_reviews[review_id] = review
         save_pending_reviews(pending_reviews)
@@ -1171,10 +1175,23 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 You are not allowed to submit questions.")
+        return ConversationHandler.END
+    remaining = is_rate_limited(user.id)
+    if remaining:
+        await update.message.reply_text(
+            f"⏳ Please wait {remaining}s before sending another question."
+        )
+        return ConversationHandler.END
+    # Starting a fresh question supersedes any pending clarification request
+    if awaiting_clarification.pop(user.id, None) is not None:
+        save_awaiting_clarification(awaiting_clarification)
     context.user_data.clear()
     await update.message.reply_text(
-        "🤫 *Confession Bot*\n\n"
-        "Go ahead — type your confession now 👇\n\n"
+        "🤫 *Anonymous Q&A*\n\n"
+        "Go ahead — type your question now 👇\n\n"
         "_You can send text, a photo, video, or voice message._\n\n"
         "Type /cancel at any time to cancel.",
         parse_mode="Markdown",
@@ -1187,12 +1204,20 @@ async def receive_confession(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ud  = context.user_data
     user = update.effective_user
 
-    remaining = is_rate_limited(user.id)
-    if remaining:
-        await update.message.reply_text(
-            f"Please wait {remaining}s before sending another confession."
-        )
-        return WAITING_CONFESSION
+    # ── Ban check ──────────────────────────────────────────────────────────
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 You are not allowed to submit questions.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # ── Rate limit (skipped when the user clicked Edit to rewrite) ─────────
+    if not context.user_data.pop("editing", False):
+        remaining = is_rate_limited(user.id)
+        if remaining:
+            await update.message.reply_text(
+                f"Please wait {remaining}s before sending another question."
+            )
+            return WAITING_CONFESSION
 
     if msg.text:
         ud["type"]    = "text"
@@ -1232,7 +1257,7 @@ async def receive_confession(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # ── All clear — show posting options ───────────────────────────────────
     await update.message.reply_text(
-        f"📝 Your confession:\n{preview}\n\n"
+        f"📝 Your question:\n{preview}\n\n"
         "How do you want to post this?",
         reply_markup=choice_keyboard(),
     )
@@ -1252,19 +1277,31 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     # ── Cancel ─────────────────────────────────────────────────────────────
     if choice == "cancel":
-        await query.edit_message_text("❌ Cancelled.\n\nType /start to send a new confession.")
+        await query.edit_message_text("❌ Cancelled.\n\nType /start to send a new question.")
         context.user_data.clear()
         return ConversationHandler.END
+
+    # ── Edit — let the user rewrite before posting ─────────────────────────
+    if choice == "edit_confession":
+        await query.edit_message_text(
+            "✏️ *Edit your question*\n\n"
+            "Send your updated question now 👇\n\n"
+            "_You can send text, a photo, video, or voice message._\n\n"
+            "Type /cancel at any time to cancel.",
+            parse_mode="Markdown",
+        )
+        context.user_data["editing"] = True
+        return WAITING_CONFESSION
 
     # ── Build label shown in channel ───────────────────────────────────────
     is_anonymous = (choice == "post_anonymous")
     confession_count = incr_count()
 
     if is_anonymous:
-        author_label = f"🤫 Anonymous Confession #{confession_count}"
+        author_label = f"🤫 Anonymous Question #{confession_count}"
     else:
         display_name = f"@{user.username}" if user.username else user.full_name
-        author_label = f"👤 Confession #{confession_count} by {display_name}"
+        author_label = f"👤 Question #{confession_count} by {display_name}"
 
     msg_type = ud.get("type")
     content  = ud.get("content", "")
@@ -1272,12 +1309,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     try:
         # ── Post to channel ────────────────────────────────────────────────
-        await post_to_group(context, msg_type, author_label, content, file_id)
-
-        # ── Feature 2: Auto-translate Chinese content ──────────────────────
-        # Runs right after posting. If content has no Chinese, or Groq is
-        # not configured, this is a no-op.
-        await post_translation(context, content, confession_count)
+        msg_id, msg_id_2 = await post_to_group(
+            context, msg_type, author_label, content, file_id,
+            reply_markup=voting_keyboard(confession_count),
+        )
 
         # ── Silent admin notification ──────────────────────────────────────
         timestamp    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1289,47 +1324,53 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 await context.bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
                     text=(
-                        f"🔔 New Confession #{confession_count} ({post_type})\n"
+                        f"🔔 New Question #{confession_count} ({post_type})\n"
                         f"{'━' * 28}\n"
                         f"👤 Name: {user.full_name}\n"
                         f"🔗 Username: {username_str}\n"
                         f"🆔 User ID: {user.id}\n"
                         f"🕐 Time: {timestamp}\n"
                         f"{'━' * 28}\n"
-                        f"📝 Content:\n{content}"
+                        f"📝 Question:\n{content}"
                     ),
                 )
             except Exception as exc:
-                logger.warning("Failed to send admin notification for confession #%d: %s", confession_count, exc)
+                logger.warning("Failed to send admin notification for question #%d: %s", confession_count, exc)
 
-        # ── Save to log ────────────────────────────────────────────────────
-        append_log({
-            "number":    confession_count,
-            "timestamp": timestamp,
-            "post_type": post_type,
-            "user_id":   user.id,
-            "full_name": user.full_name,
-            "username":  username_str,
-            "content":   content,
-            "status":    STATUS_PUBLISHED,
-        })
+        # ── Save to log (including message IDs for /delete and /answer) ───
+        log_entry: dict = {
+            "number":     confession_count,
+            "timestamp":  timestamp,
+            "post_type":  post_type,
+            "user_id":    user.id,
+            "full_name":  user.full_name,
+            "username":   username_str,
+            "content":    content,
+            "status":     STATUS_PUBLISHED,
+            "message_id": msg_id,
+            "msg_type":     msg_type,
+            "author_label": author_label,
+        }
+        if msg_id_2:
+            log_entry["message_id_2"] = msg_id_2
+        append_log(log_entry)
 
         # ── Confirm to user ────────────────────────────────────────────────
         await query.edit_message_text(
-            f"✅ *Confession #{confession_count} posted!*\n\n"
-            f"Type /start to send another confession.",
+            f"✅ *Question #{confession_count} posted!*\n\n"
+            f"Type /start to send another question.",
             parse_mode="Markdown",
         )
         logger.info(
-            "Confession #%d | %s | user_id=%d | %s",
+            "Question #%d | %s | user_id=%d | %s",
             confession_count, post_type, user.id, user.full_name,
         )
 
     except Exception as exc:
-        logger.error("Failed to post confession: %s", exc)
+        logger.error("Failed to post question: %s", exc)
         decr_count()
         await query.edit_message_text(
-            "❌ Couldn't post your confession.\n"
+            "❌ Couldn't post your question.\n"
             "The item was not published. Please try again later."
         )
 
@@ -1338,13 +1379,13 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 # ─── /cancel command ──────────────────────────────────────────────────────────
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Cancelled.\n\nType /start to send a new confession.")
+    await update.message.reply_text("❌ Cancelled.\n\nType /start to send a new question.")
     context.user_data.clear()
     return ConversationHandler.END
 
 # ─── Message outside conversation ─────────────────────────────────────────────
 async def prompt_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Type /start to send a confession.")
+    await update.message.reply_text("Type /start to ask a question.")
 
 # ─── Admin: /getid ────────────────────────────────────────────────────────────
 async def get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1372,11 +1413,11 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     entry = next((e for e in load_log() if e.get("number") == target), None)
 
     if not entry:
-        await update.message.reply_text(f"❌ No record for Confession #{target}.")
+        await update.message.reply_text(f"❌ No record for Question #{target}.")
         return
 
     await update.message.reply_text(
-        f"🔍 Confession #{target} — Sender Info\n"
+        f"🔍 Question #{target} — Asker Info\n"
         f"{'━' * 28}\n"
         f"📌 Type: {entry.get('post_type', '?')}\n"
         f"👤 Name: {entry.get('full_name', '?')}\n"
@@ -1385,12 +1426,12 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🕐 Sent at: {entry.get('timestamp', '?')}\n"
         f"Status: {entry.get('status', 'unknown')}\n"
         f"{'━' * 28}\n"
-        f"📝 Content:\n{entry.get('content', '(media)')}",
+        f"📝 Question:\n{entry.get('content', '(media)')}",
     )
 
 # ─── Admin: /filter_stats ─────────────────────────────────────────────────────
 async def filter_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show how many confessions have been flagged for review and by which category."""
+    """Show how many questions have been flagged for review and by which category."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Admins only.")
         return
@@ -1400,7 +1441,7 @@ async def filter_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if total == 0:
         await update.message.reply_text(
-            "✅ No confessions have been flagged by the AI filter yet.\n"
+            "✅ No questions have been flagged by the AI filter yet.\n"
             f"Filter status: {'🟢 Active' if FILTER_ENABLED else '🔴 Disabled (set GROQ_API_KEY)'}"
         )
         return
@@ -1428,10 +1469,10 @@ async def filter_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-# ─── NEW Admin: /pending — list confessions currently awaiting review ──────────
+# ─── NEW Admin: /pending — list questions currently awaiting review ──────────
 async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Show all confessions currently sitting in the pending_reviews queue.
+    Show all questions currently sitting in the pending_reviews queue.
     Useful if the admin missed a review notification.
     """
     if not is_admin(update.effective_user.id):
@@ -1439,7 +1480,7 @@ async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if not pending_reviews:
-        await update.message.reply_text("✅ No confessions are pending review right now.")
+        await update.message.reply_text("✅ No questions are pending review right now.")
         return
 
     lines = [f"⏳ Pending Reviews ({len(pending_reviews)})", f"{'━' * 28}"]
@@ -1449,7 +1490,7 @@ async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🆔 {rid} | {r['full_name']} | {cat_label} | {r['timestamp']}"
         )
     lines.append(f"\n{'━' * 28}")
-    lines.append("Use /review <id> to resend the approval buttons for a pending confession.")
+    lines.append("Use /review <id> to resend the approval buttons for a pending question.")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -1488,7 +1529,7 @@ async def resend_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text(
         (
-            f"⚠️ Pending Confession Review\n"
+            f"⚠️ Pending Question Review\n"
             f"{'━' * 28}\n"
             f"🆔 Review ID:  {review_id}\n"
             f"👤 Name:       {review.get('full_name', '?')}\n"
@@ -1499,10 +1540,295 @@ async def resend_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"🤖 Reason:     {review.get('reason', '?')}\n"
             f"📊 Confidence: {confidence:.0%} ({method})\n"
             f"{'━' * 28}\n"
-            f"📝 Content:\n{review.get('content', '')}"
+            f"📝 Question:\n{review.get('content', '')}"
         ),
         reply_markup=review_keyboard,
     )
+
+
+# ─── Admin: /ban <user_id> ────────────────────────────────────────────────────
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Permanently block a user from submitting questions."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <user_id>\n\nGet the user ID from /lookup <#> or the admin notification.")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Please provide a valid numeric user ID.")
+        return
+
+    banned_users.add(target_id)
+    save_banned_users(banned_users)
+    logger.info("Admin BANNED user_id=%d", target_id)
+    await update.message.reply_text(
+        f"✅ User `{target_id}` has been banned.\n"
+        "They will no longer be able to submit questions.\n"
+        "Use /unban <user_id> to reverse this.",
+        parse_mode="Markdown",
+    )
+
+
+# ─── Admin: /unban <user_id> ──────────────────────────────────────────────────
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a user from the ban list."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <user_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Please provide a valid numeric user ID.")
+        return
+
+    if target_id not in banned_users:
+        await update.message.reply_text(f"ℹ️ User `{target_id}` is not currently banned.", parse_mode="Markdown")
+        return
+
+    banned_users.discard(target_id)
+    save_banned_users(banned_users)
+    logger.info("Admin UNBANNED user_id=%d", target_id)
+    await update.message.reply_text(
+        f"✅ User `{target_id}` has been unbanned and can submit questions again.",
+        parse_mode="Markdown",
+    )
+
+
+# ─── Admin: /delete <confession_number> ───────────────────────────────────────
+async def delete_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Delete a posted question from the group channel by its question number.
+    Also removes the paired overflow-text message and answer reply, if any.
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /delete <question_number>\n\nExample: /delete 42")
+        return
+
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Please provide a valid question number.")
+        return
+
+    entry = next((e for e in load_log() if e.get("number") == target), None)
+    if not entry:
+        await update.message.reply_text(f"❌ No record found for Question #{target}.")
+        return
+
+    msg_id = entry.get("message_id")
+    if not msg_id:
+        await update.message.reply_text(
+            f"❌ Question #{target} has no stored message ID.\n"
+            "It may have been posted before this feature was added."
+        )
+        return
+
+    deleted = []
+    failed  = []
+
+    # Delete primary message
+    try:
+        await context.bot.delete_message(chat_id=GROUP_CHAT_ID, message_id=msg_id)
+        deleted.append("question")
+    except Exception as exc:
+        failed.append(f"question ({exc})")
+
+    # Delete overflow text message (long photo/video captions)
+    msg_id_2 = entry.get("message_id_2")
+    if msg_id_2:
+        try:
+            await context.bot.delete_message(chat_id=GROUP_CHAT_ID, message_id=msg_id_2)
+            deleted.append("overflow text")
+        except Exception as exc:
+            failed.append(f"overflow text ({exc})")
+
+    # Update log entry status
+    log = load_log()
+    for e in log:
+        if e.get("number") == target:
+            e["status"]     = "deleted"
+            e["deleted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            e["deleted_by"] = update.effective_user.id
+            break
+    save_log(log)
+
+    parts = []
+    if deleted:
+        parts.append(f"✅ Deleted: {', '.join(deleted)}")
+    if failed:
+        parts.append(f"⚠️ Could not delete: {', '.join(failed)}")
+    await update.message.reply_text(
+        f"Question #{target}\n" + "\n".join(parts)
+    )
+    logger.info("Admin DELETED Question #%d (user_id=%d)", target, update.effective_user.id)
+
+
+# ─── /help — user guide ───────────────────────────────────────────────────────
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show a user-facing guide for the Q&A bot."""
+    await update.message.reply_text(
+        "🤫 *Anonymous Q&A — Help*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📮 *How to ask a question:*\n"
+        "1. Type /start to begin\n"
+        "2. Send your question — text, photo, video, or voice note\n"
+        "3. Choose how you want it posted\n\n"
+        "🎛️ *Posting options:*\n"
+        "• 🤫 *Post Anonymously* — your name stays hidden\n"
+        "• 👤 *Post Publicly* — your @username is shown\n"
+        "• ✏️ *Edit* — rewrite your question before posting\n"
+        "• ❌ *Cancel* — discard and start over\n\n"
+        "👍 *Upvoting:* tap the upvote button under any question in the group "
+        "to show it's something you'd like answered too\n\n"
+        "⏱️ *Rate limit:* 5 seconds between submissions\n\n"
+        "📋 *Commands:*\n"
+        "/start — Ask a new question\n"
+        "/cancel — Cancel your current question\n"
+        "/help — Show this guide",
+        parse_mode="Markdown",
+    )
+
+
+# ─── Teacher: /ask <#> <text> — request clarification from the asker ──────────
+async def ask_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Send the original asker an anonymous DM requesting clarification on
+    their question. Their next message back to the bot is automatically
+    relayed to the teacher (see handle_clarification_reply).
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /ask <question_number> <what you need clarified>\n\n"
+            "Example: /ask 7 Which chapter are you referring to?"
+        )
+        return
+
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Please provide a valid question number.")
+        return
+
+    clarification_text = " ".join(context.args[1:]).strip()
+
+    entry = next((e for e in load_log() if e.get("number") == target), None)
+    if not entry or not entry.get("user_id"):
+        await update.message.reply_text(f"❌ No record found for Question #{target}.")
+        return
+
+    asker_id = entry["user_id"]
+
+    try:
+        await context.bot.send_message(
+            chat_id=asker_id,
+            text=(
+                f"🧑‍🏫 Your teacher would like more details on your Question #{target}:\n\n"
+                f"❓ {clarification_text}\n\n"
+                "Just reply here with more info — it'll be sent straight to your teacher."
+            ),
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            f"⚠️ Could not DM the asker for Question #{target}: {exc}\n"
+            "They may have blocked the bot or never started a chat with it."
+        )
+        return
+
+    awaiting_clarification[asker_id] = target
+    save_awaiting_clarification(awaiting_clarification)
+
+    await update.message.reply_text(
+        f"✅ Clarification request sent for Question #{target}.\n"
+        "I'll forward their reply to you here as soon as they respond."
+    )
+    logger.info("Admin requested clarification on Question #%d from user_id=%d", target, asker_id)
+
+
+# ─── Catches a student's reply to a pending /ask clarification request ────────
+async def handle_clarification_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Registered in an earlier handler group than the conversation flow, so it
+    sees every private message first. If the sender has a pending
+    clarification request, their message is relayed to the teacher and
+    consumed here (via ApplicationHandlerStop) — it never reaches the normal
+    /start flow. Otherwise this is a silent no-op and the update falls
+    through to the regular handlers untouched.
+    """
+    user = update.effective_user
+    if not user or user.id not in awaiting_clarification:
+        return  # not a clarification reply — let other handlers process it
+
+    target = awaiting_clarification.pop(user.id)
+    save_awaiting_clarification(awaiting_clarification)
+
+    reply_text = (
+        update.message.text
+        or update.message.caption
+        or "(sent a photo/video/voice message with no caption)"
+    )
+
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"💬 Clarification reply for Question #{target}:\n\n{reply_text}",
+            )
+        except Exception as exc:
+            logger.warning("Failed to relay clarification reply for Question #%d: %s", target, exc)
+
+    await update.message.reply_text("✅ Sent to your teacher. Thanks for clarifying!")
+
+    raise ApplicationHandlerStop
+
+
+# ─── Student: tap 👍 to upvote a question ──────────────────────────────────────
+async def handle_upvote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anonymous upvote — one vote per user per question, tracked in Redis."""
+    query = update.callback_query
+    user  = update.effective_user
+
+    try:
+        number = int(query.data.split("_", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+
+    votes = load_votes(number)
+    if user.id in votes["voters"]:
+        await query.answer("You've already upvoted this question 👍", show_alert=False)
+        return
+
+    votes["voters"].append(user.id)
+    votes["count"] = len(votes["voters"])
+    save_votes(number, votes)
+
+    await query.answer("👍 Upvoted!")
+
+    new_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"👍 Upvote ({votes['count']})", callback_data=f"upvote_{number}")
+    ]])
+    try:
+        await query.edit_message_reply_markup(reply_markup=new_keyboard)
+    except Exception as exc:
+        logger.warning("Could not update vote count display for Question #%d: %s", number, exc)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -1513,8 +1839,8 @@ def main() -> None:
 
     if not FILTER_ENABLED:
         logger.warning(
-            "Groq AI filter is DISABLED — set GROQ_API_KEY to enable AI moderation "
-            "and Chinese auto-translation. Blocklisted domains still go to admin review."
+            "Groq AI filter is DISABLED — set GROQ_API_KEY to enable AI moderation. "
+            "Blocklisted domains still go to admin review."
         )
     else:
         serper_status = (
@@ -1523,7 +1849,7 @@ def main() -> None:
             else "Groq only (no URL reputation)"
         )
         logger.info(
-            "AI filter ENABLED — %s | Admin review workflow: ON | Auto-translate: ON",
+            "AI filter ENABLED — %s | Admin review workflow: ON",
             serper_status,
         )
 
@@ -1554,7 +1880,7 @@ def main() -> None:
                 MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, receive_confession)
             ],
             WAITING_CHOICE: [
-                CallbackQueryHandler(handle_choice, pattern="^(post_anonymous|post_public|cancel)$")
+                CallbackQueryHandler(handle_choice, pattern="^(post_anonymous|post_public|cancel|edit_confession)$")
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
@@ -1562,12 +1888,26 @@ def main() -> None:
         per_chat=True,
     )
 
+    # ── Clarification-reply catcher — runs BEFORE the conversation handler so
+    #   a student's reply to a pending /ask request is intercepted first.
+    #   It's a silent no-op for everyone without a pending request.
+    telegram_app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_clarification_reply),
+        group=-1,
+    )
+
     telegram_app.add_handler(conv_handler)
+    telegram_app.add_handler(CallbackQueryHandler(handle_upvote, pattern=r"^upvote_\d+$"))
     telegram_app.add_handler(CommandHandler("getid",        get_chat_id))
     telegram_app.add_handler(CommandHandler("lookup",       lookup))
     telegram_app.add_handler(CommandHandler("filter_stats", filter_stats))
-    telegram_app.add_handler(CommandHandler("pending",      list_pending))   # NEW
+    telegram_app.add_handler(CommandHandler("pending",      list_pending))
     telegram_app.add_handler(CommandHandler("review",       resend_review))
+    telegram_app.add_handler(CommandHandler("ban",          ban_user))
+    telegram_app.add_handler(CommandHandler("unban",        unban_user))
+    telegram_app.add_handler(CommandHandler("delete",       delete_confession))
+    telegram_app.add_handler(CommandHandler("ask",          ask_clarification))
+    telegram_app.add_handler(CommandHandler("help",         help_command))
 
     # Catch any message sent outside the /start flow
     telegram_app.add_handler(MessageHandler(
@@ -1576,15 +1916,17 @@ def main() -> None:
     ))
 
     # ── Load persistent state from Redis ──────────────────────────────────
-    global confession_count, pending_reviews
-    confession_count = load_count()
-    pending_reviews  = load_pending_reviews()
+    global confession_count, pending_reviews, banned_users, awaiting_clarification
+    confession_count        = load_count()
+    pending_reviews         = load_pending_reviews()
+    banned_users            = load_banned_users()
+    awaiting_clarification  = load_awaiting_clarification()
     logger.info(
-        "Loaded from Redis — confession_count=%d, pending_reviews=%d",
-        confession_count, len(pending_reviews),
+        "Loaded from Redis — question_count=%d, pending_reviews=%d, banned_users=%d, awaiting_clarification=%d",
+        confession_count, len(pending_reviews), len(banned_users), len(awaiting_clarification),
     )
 
-    print("🤖  Confession bot is running.")
+    print("🤖  Q&A bot is running.")
     telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
