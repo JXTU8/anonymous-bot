@@ -67,7 +67,7 @@ REDIS_BANNED_KEY  = "confession:banned_users"
 REDIS_VOTES_PREFIX = "confession:votes:"
 REDIS_CLARIFY_KEY  = "confession:awaiting_clarification"
 
-RATE_LIMIT_SECONDS = 5
+RATE_LIMIT_SECONDS = 3
 TELEGRAM_CAPTION_LIMIT = 1024
 
 # ─── Groq client (optional — features silently degrade without it) ────────────
@@ -488,12 +488,12 @@ def is_banned(user_id: int) -> bool:
 def choice_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🤫 Post Anonymously", callback_data="post_anonymous"),
-            InlineKeyboardButton("👤 Post Publicly",    callback_data="post_public"),
+            InlineKeyboardButton("Post Anonymously", callback_data="post_anonymous"),
+            InlineKeyboardButton("Post Publicly",    callback_data="post_public"),
         ],
         [
-            InlineKeyboardButton("✏️ Edit",   callback_data="edit_confession"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+            InlineKeyboardButton("Edit",   callback_data="edit_confession"),
+            InlineKeyboardButton("Cancel", callback_data="cancel"),
         ],
     ])
 
@@ -1061,7 +1061,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
     post_type = "Anonymous" if is_anonymous else "Public"
 
     if is_anonymous:
-        author_label = f"🤫 Anonymous Question #{confession_count}"
+        author_label = f"Anonymous Question #{confession_count}"
     else:
         # Use the stored username/name from when the question was submitted
         display_name = (
@@ -1298,7 +1298,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     confession_count = incr_count()
 
     if is_anonymous:
-        author_label = f"🤫 Anonymous Question #{confession_count}"
+        author_label = f"Anonymous Question #{confession_count}"
     else:
         display_name = f"@{user.username}" if user.username else user.full_name
         author_label = f"👤 Question #{confession_count} by {display_name}"
@@ -1740,9 +1740,9 @@ async def ask_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await context.bot.send_message(
             chat_id=asker_id,
             text=(
-                f"🧑‍🏫 Your teacher would like more details on your Question #{target}:\n\n"
+                f"🧑‍🏫 Your friend would like more details on your Question #{target}:\n\n"
                 f"❓ {clarification_text}\n\n"
-                "Just reply here with more info — it'll be sent straight to your teacher."
+                "Just reply here with more info — it'll be sent straight to your friend."
             ),
         )
     except Exception as exc:
