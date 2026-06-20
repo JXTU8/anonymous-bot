@@ -67,7 +67,7 @@ REDIS_BANNED_KEY  = "confession:banned_users"
 REDIS_VOTES_PREFIX = "confession:votes:"
 REDIS_CLARIFY_KEY  = "confession:awaiting_clarification"
 
-RATE_LIMIT_SECONDS = 3
+RATE_LIMIT_SECONDS = 5
 TELEGRAM_CAPTION_LIMIT = 1024
 
 # ─── Groq client (optional — features silently degrade without it) ────────────
@@ -107,44 +107,61 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT)
 
 # ─── Upstash Redis helpers ────────────────────────────────────────────────────
-def _redis(method: str, *path_parts, body=None):
+def _redis(*command: str):
     """
-    Thin wrapper around the Upstash Redis REST API.
-    Returns the parsed JSON response, or None on error.
+    Execute one Redis command via the Upstash REST API using the POST +
+    JSON-body "command pipeline" style, e.g. _redis("SET", "key", "value").
+
+    IMPORTANT: this sends the command as a JSON array in the POST body,
+    NOT as raw text glued into the URL path. That matters because question
+    content is arbitrary user text — it can contain "/", quotes, unicode,
+    newlines, etc. Putting that directly in a URL path (the old approach)
+    silently corrupts the request: a "/" splits the path into extra
+    segments, Upstash misparses the argument count, and — because Upstash
+    returns HTTP 200 with {"error": ...} rather than an HTTP error status —
+    the failure was invisible unless you checked the response body.
+    Sending the value inside a JSON POST body sidesteps all of this.
+
+    Returns the parsed JSON response dict (e.g. {"result": "OK"}), or None
+    if the request itself failed (network error, bad credentials, etc.).
     """
     if not UPSTASH_REDIS_URL or not UPSTASH_REDIS_TOKEN:
         return None
-    url = UPSTASH_REDIS_URL.rstrip("/") + "/" + "/".join(str(p) for p in path_parts)
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
+    url = UPSTASH_REDIS_URL.rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}",
+        "Content-Type": "application/json",
+    }
     try:
-        if body is not None:
-            resp = http_requests.post(url, headers=headers, json=body, timeout=5)
-        else:
-            resp = http_requests.get(url, headers=headers, timeout=5)
+        resp = http_requests.post(url, headers=headers, json=list(command), timeout=8)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if isinstance(data, dict) and "error" in data:
+            logger.warning("Upstash command error (%s): %s", command[0] if command else "?", data["error"])
+            return None
+        return data
     except Exception as exc:
-        logger.warning("Redis REST error (%s): %s", method, exc)
+        logger.warning("Redis REST error (%s): %s", command[0] if command else "?", exc)
         return None
 
 
 def redis_get(key: str):
     """GET key — returns the value string or None."""
-    result = _redis("GET", "get", key)
+    result = _redis("GET", key)
     if result and "result" in result:
         return result["result"]
     return None
 
 
 def redis_set(key: str, value: str) -> bool:
-    """SET key value."""
-    result = _redis("SET", "set", key, value)
-    return result is not None
+    """SET key value. Returns True only on a confirmed {"result": "OK"} response."""
+    result = _redis("SET", key, value)
+    return bool(result) and result.get("result") == "OK"
 
 
 def redis_incr(key: str) -> int:
     """INCR key — atomic increment, returns new value."""
-    result = _redis("INCR", "incr", key)
+    result = _redis("INCR", key)
     if result and "result" in result:
         return int(result["result"])
     return 0
@@ -152,7 +169,7 @@ def redis_incr(key: str) -> int:
 
 def redis_decr(key: str) -> int:
     """DECR key — atomic decrement, floors at 0 via a follow-up check."""
-    result = _redis("DECR", "decr", key)
+    result = _redis("DECR", key)
     if result and "result" in result:
         val = int(result["result"])
         if val < 0:
@@ -228,7 +245,12 @@ def load_json_list(key: str, file_path: str) -> list:
 
 def save_json_list(key: str, file_path: str, data: list) -> None:
     payload = json.dumps(data, ensure_ascii=False, indent=2)
-    redis_set(key, payload)
+    if not redis_set(key, payload):
+        logger.warning(
+            "Redis save FAILED for key=%s (%d bytes) — data only written to local disk, "
+            "which does not persist across Render restarts/redeploys.",
+            key, len(payload),
+        )
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(payload)
 
@@ -488,12 +510,12 @@ def is_banned(user_id: int) -> bool:
 def choice_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("Post Anonymously", callback_data="post_anonymous"),
-            InlineKeyboardButton("Post Publicly",    callback_data="post_public"),
+            InlineKeyboardButton("🤫 Post Anonymously", callback_data="post_anonymous"),
+            InlineKeyboardButton("👤 Post Publicly",    callback_data="post_public"),
         ],
         [
-            InlineKeyboardButton("Edit",   callback_data="edit_confession"),
-            InlineKeyboardButton("Cancel", callback_data="cancel"),
+            InlineKeyboardButton("✏️ Edit",   callback_data="edit_confession"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
         ],
     ])
 
@@ -1740,9 +1762,9 @@ async def ask_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await context.bot.send_message(
             chat_id=asker_id,
             text=(
-                f"🧑‍🏫 Your friend would like more details on your Question #{target}:\n\n"
+                f"🧑‍🏫 Your teacher would like more details on your Question #{target}:\n\n"
                 f"❓ {clarification_text}\n\n"
-                "Just reply here with more info — it'll be sent straight to your friend."
+                "Just reply here with more info — it'll be sent straight to your teacher."
             ),
         )
     except Exception as exc:
