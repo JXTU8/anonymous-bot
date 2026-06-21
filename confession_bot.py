@@ -69,6 +69,7 @@ REDIS_CLARIFY_KEY  = "confession:awaiting_clarification"
 
 RATE_LIMIT_SECONDS = 5
 TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_TEXT_LIMIT = 4096
 
 # ─── Groq client (optional — features silently degrade without it) ────────────
 try:
@@ -145,58 +146,69 @@ def _redis(*command: str):
         return None
 
 
-def redis_get(key: str):
+async def _redis_async(*command: str):
+    """
+    Async wrapper around _redis(). The actual HTTP call (http_requests.post)
+    is blocking — running it directly inside an `async def` handler would
+    freeze the bot's single event loop for every other user (including the
+    admin) for the duration of the network round-trip. asyncio.to_thread
+    runs it on a worker thread instead, so the event loop stays responsive.
+    """
+    return await asyncio.to_thread(_redis, *command)
+
+
+async def redis_get(key: str):
     """GET key — returns the value string or None."""
-    result = _redis("GET", key)
+    result = await _redis_async("GET", key)
     if result and "result" in result:
         return result["result"]
     return None
 
 
-def redis_set(key: str, value: str) -> bool:
+async def redis_set(key: str, value: str) -> bool:
     """SET key value. Returns True only on a confirmed {"result": "OK"} response."""
-    result = _redis("SET", key, value)
+    result = await _redis_async("SET", key, value)
     return bool(result) and result.get("result") == "OK"
 
 
-def redis_incr(key: str) -> int:
+async def redis_incr(key: str) -> int:
     """INCR key — atomic increment, returns new value."""
-    result = _redis("INCR", key)
+    result = await _redis_async("INCR", key)
     if result and "result" in result:
         return int(result["result"])
     return 0
 
 
-def redis_decr(key: str) -> int:
+async def redis_decr(key: str) -> int:
     """DECR key — atomic decrement, floors at 0 via a follow-up check."""
-    result = _redis("DECR", key)
+    result = await _redis_async("DECR", key)
     if result and "result" in result:
         val = int(result["result"])
         if val < 0:
-            redis_set(key, "0")
+            await redis_set(key, "0")
             return 0
         return val
     return 0
 
 
 # ─── Confession counter (Redis-backed) ────────────────────────────────────────
-def load_count() -> int:
+async def load_count() -> int:
     """Read confession counter from Redis. Falls back to 0 if unavailable."""
-    val = redis_get(REDIS_COUNT_KEY)
+    val = await redis_get(REDIS_COUNT_KEY)
     try:
         return int(val) if val is not None else 0
     except (ValueError, TypeError):
         return 0
 
 
-def save_count(n: int) -> None:
+async def save_count(n: int) -> None:
     """Write confession counter to Redis."""
-    redis_set(REDIS_COUNT_KEY, str(n))
+    await redis_set(REDIS_COUNT_KEY, str(n))
 
 
-def incr_count() -> int:
+async def incr_count() -> int:
     """Atomically increment and return new confession count."""
-    new_val = redis_incr(REDIS_COUNT_KEY)
+    new_val = await redis_incr(REDIS_COUNT_KEY)
     if new_val == 0:
         # Redis unavailable — fall back to in-memory increment
         global confession_count
@@ -205,15 +217,15 @@ def incr_count() -> int:
     return new_val
 
 
-def decr_count() -> None:
+async def decr_count() -> None:
     """Atomically decrement confession count (rollback on post failure)."""
-    redis_decr(REDIS_COUNT_KEY)
+    await redis_decr(REDIS_COUNT_KEY)
 
 
 # ─── Pending reviews (Redis-backed) ───────────────────────────────────────────
-def load_pending_reviews() -> dict:
+async def load_pending_reviews() -> dict:
     """Load pending reviews dict from Redis."""
-    raw = redis_get(REDIS_PENDING_KEY)
+    raw = await redis_get(REDIS_PENDING_KEY)
     if not raw:
         return {}
     try:
@@ -222,13 +234,13 @@ def load_pending_reviews() -> dict:
         return {}
 
 
-def save_pending_reviews(data: dict) -> None:
+async def save_pending_reviews(data: dict) -> None:
     """Persist pending reviews dict to Redis."""
-    redis_set(REDIS_PENDING_KEY, json.dumps(data, ensure_ascii=False))
+    await redis_set(REDIS_PENDING_KEY, json.dumps(data, ensure_ascii=False))
 
 
-def load_json_list(key: str, file_path: str) -> list:
-    raw = redis_get(key)
+async def load_json_list(key: str, file_path: str) -> list:
+    raw = await redis_get(key)
     if raw:
         try:
             data = json.loads(raw)
@@ -243,9 +255,9 @@ def load_json_list(key: str, file_path: str) -> list:
         return []
 
 
-def save_json_list(key: str, file_path: str, data: list) -> None:
+async def save_json_list(key: str, file_path: str, data: list) -> None:
     payload = json.dumps(data, ensure_ascii=False, indent=2)
-    if not redis_set(key, payload):
+    if not await redis_set(key, payload):
         logger.warning(
             "Redis save FAILED for key=%s (%d bytes) — data only written to local disk, "
             "which does not persist across Render restarts/redeploys.",
@@ -255,22 +267,22 @@ def save_json_list(key: str, file_path: str, data: list) -> None:
         f.write(payload)
 
 
-def load_log() -> list:
-    return load_json_list(REDIS_LOG_KEY, LOG_FILE)
+async def load_log() -> list:
+    return await load_json_list(REDIS_LOG_KEY, LOG_FILE)
 
 
-def save_log(log: list) -> None:
-    save_json_list(REDIS_LOG_KEY, LOG_FILE, log)
+async def save_log(log: list) -> None:
+    await save_json_list(REDIS_LOG_KEY, LOG_FILE, log)
 
 
-def append_log(entry: dict) -> None:
-    log = load_log()
+async def append_log(entry: dict) -> None:
+    log = await load_log()
     log.append(entry)
-    save_log(log)
+    await save_log(log)
 
 
-def update_log_by_review_id(review_id: str, updates: dict) -> bool:
-    log = load_log()
+async def update_log_by_review_id(review_id: str, updates: dict) -> bool:
+    log = await load_log()
     changed = False
     for entry in log:
         if entry.get("review_id") == review_id:
@@ -278,26 +290,26 @@ def update_log_by_review_id(review_id: str, updates: dict) -> bool:
             changed = True
             break
     if changed:
-        save_log(log)
+        await save_log(log)
     return changed
 
 
-def load_filter_log() -> list:
-    return load_json_list(REDIS_FILTER_KEY, FILTER_LOG)
+async def load_filter_log() -> list:
+    return await load_json_list(REDIS_FILTER_KEY, FILTER_LOG)
 
 
-def save_filter_log(log: list) -> None:
-    save_json_list(REDIS_FILTER_KEY, FILTER_LOG, log)
+async def save_filter_log(log: list) -> None:
+    await save_json_list(REDIS_FILTER_KEY, FILTER_LOG, log)
 
 
-def append_filter_log(entry: dict) -> None:
-    log = load_filter_log()
+async def append_filter_log(entry: dict) -> None:
+    log = await load_filter_log()
     log.append(entry)
-    save_filter_log(log)
+    await save_filter_log(log)
 
 
-def update_filter_log_by_review_id(review_id: str, updates: dict) -> bool:
-    log = load_filter_log()
+async def update_filter_log_by_review_id(review_id: str, updates: dict) -> bool:
+    log = await load_filter_log()
     changed = False
     for entry in log:
         if entry.get("review_id") == review_id:
@@ -305,12 +317,12 @@ def update_filter_log_by_review_id(review_id: str, updates: dict) -> bool:
             changed = True
             break
     if changed:
-        save_filter_log(log)
+        await save_filter_log(log)
     return changed
 
 
-def load_custom_block_domains() -> set[str]:
-    raw = redis_get(REDIS_DOMAINS_KEY)
+async def load_custom_block_domains() -> set[str]:
+    raw = await redis_get(REDIS_DOMAINS_KEY)
     if not raw:
         return set()
     try:
@@ -320,13 +332,13 @@ def load_custom_block_domains() -> set[str]:
         return set()
 
 
-def save_custom_block_domains(domains: set[str]) -> None:
-    redis_set(REDIS_DOMAINS_KEY, json.dumps(sorted(domains), ensure_ascii=False))
+async def save_custom_block_domains(domains: set[str]) -> None:
+    await redis_set(REDIS_DOMAINS_KEY, json.dumps(sorted(domains), ensure_ascii=False))
 
 
-def load_banned_users() -> set:
+async def load_banned_users() -> set:
     """Load the set of banned user IDs from Redis."""
-    raw = redis_get(REDIS_BANNED_KEY)
+    raw = await redis_get(REDIS_BANNED_KEY)
     if not raw:
         return set()
     try:
@@ -335,15 +347,15 @@ def load_banned_users() -> set:
         return set()
 
 
-def save_banned_users(banned: set) -> None:
+async def save_banned_users(banned: set) -> None:
     """Persist the banned user IDs set to Redis."""
-    redis_set(REDIS_BANNED_KEY, json.dumps(sorted(banned), ensure_ascii=False))
+    await redis_set(REDIS_BANNED_KEY, json.dumps(sorted(banned), ensure_ascii=False))
 
 
 # ─── Upvotes (Redis-backed, one key per question number) ────────────────────
-def load_votes(number: int) -> dict:
+async def load_votes(number: int) -> dict:
     """Load {'count': int, 'voters': [user_id, ...]} for a question. Defaults to empty."""
-    raw = redis_get(f"{REDIS_VOTES_PREFIX}{number}")
+    raw = await redis_get(f"{REDIS_VOTES_PREFIX}{number}")
     if not raw:
         return {"count": 0, "voters": []}
     try:
@@ -354,16 +366,16 @@ def load_votes(number: int) -> dict:
         return {"count": 0, "voters": []}
 
 
-def save_votes(number: int, data: dict) -> None:
+async def save_votes(number: int, data: dict) -> None:
     """Persist vote data for a question."""
-    redis_set(f"{REDIS_VOTES_PREFIX}{number}", json.dumps(data, ensure_ascii=False))
+    await redis_set(f"{REDIS_VOTES_PREFIX}{number}", json.dumps(data, ensure_ascii=False))
 
 
 # ─── Pending clarification requests (Redis-backed) ───────────────────────────
 # Maps user_id -> question number the admin is asking them to clarify.
 # Consumed by handle_clarification_reply when the student replies.
-def load_awaiting_clarification() -> dict:
-    raw = redis_get(REDIS_CLARIFY_KEY)
+async def load_awaiting_clarification() -> dict:
+    raw = await redis_get(REDIS_CLARIFY_KEY)
     if not raw:
         return {}
     try:
@@ -372,12 +384,12 @@ def load_awaiting_clarification() -> dict:
         return {}
 
 
-def save_awaiting_clarification(data: dict) -> None:
-    redis_set(REDIS_CLARIFY_KEY, json.dumps({str(k): v for k, v in data.items()}, ensure_ascii=False))
+async def save_awaiting_clarification(data: dict) -> None:
+    await redis_set(REDIS_CLARIFY_KEY, json.dumps({str(k): v for k, v in data.items()}, ensure_ascii=False))
 
 
-def active_ad_domains() -> set[str]:
-    return set(AD_DOMAINS) | load_custom_block_domains()
+async def active_ad_domains() -> set[str]:
+    return set(AD_DOMAINS) | await load_custom_block_domains()
 
 
 def normalize_domain(domain: str) -> str:
@@ -387,12 +399,6 @@ def normalize_domain(domain: str) -> str:
     if domain.startswith("www."):
         domain = domain[4:]
     return domain
-
-
-def shorten(text: str, limit: int = 3500) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 20] + "\n...[truncated]"
 
 
 def safe_preview(text: str, limit: int = 120) -> str:
@@ -418,8 +424,17 @@ async def post_to_group(
     """
     text = f"{author_label}\n\n{content}".strip()
     if msg_type == "text":
-        msg = await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, reply_markup=reply_markup)
-        return msg.message_id, None
+        if len(text) <= TELEGRAM_TEXT_LIMIT:
+            msg = await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, reply_markup=reply_markup)
+            return msg.message_id, None
+        else:
+            # author_label + content together exceed Telegram's 4096-char
+            # text limit (content alone is always within bounds, since
+            # Telegram caps incoming messages at 4096 too) — split into two
+            # messages, same pattern as the photo/video overflow case below.
+            msg  = await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=author_label, reply_markup=reply_markup)
+            msg2 = await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=content)
+            return msg.message_id, msg2.message_id
     elif msg_type == "photo":
         if len(text) <= TELEGRAM_CAPTION_LIMIT:
             msg = await context.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=file_id, caption=text, reply_markup=reply_markup)
@@ -456,38 +471,6 @@ def is_rate_limited(user_id: int) -> int:
 def mark_submit(user_id: int) -> None:
     last_submit_at[user_id] = datetime.now()
 
-
-def find_record(record_id: str) -> dict | None:
-    if record_id in pending_reviews:
-        r = dict(pending_reviews[record_id])
-        r["review_id"] = record_id
-        return r
-    for entry in reversed(load_log()):
-        if str(entry.get("review_id")) == record_id or str(entry.get("number")) == record_id:
-            return entry
-    return None
-
-
-def format_record(entry: dict) -> str:
-    moderation = entry.get("moderation") or {}
-    lines = [
-        f"Status: {entry.get('status', 'unknown')}",
-        f"Review ID: {entry.get('review_id', '-')}",
-        f"Number: {entry.get('number', '-')}",
-        f"Type: {entry.get('post_type', '-')}",
-        f"Name: {entry.get('full_name', '?')}",
-        f"Username: {entry.get('username') or entry.get('username_str', '?')}",
-        f"User ID: {entry.get('user_id', '?')}",
-        f"Time: {entry.get('timestamp', '?')}",
-    ]
-    if moderation:
-        lines += [
-            f"Moderation: {moderation.get('category', '?')} ({moderation.get('confidence', 0):.0%})",
-            f"Reason: {moderation.get('reason', '?')}",
-        ]
-    lines.append(f"Content:\n{entry.get('content', '(media)')}")
-    return "\n".join(lines)
-
 confession_count = 0  # loaded from Redis in main() — do not use before that
 
 # ─── Pending reviews — loaded from Redis on startup ──────────────────────────
@@ -520,9 +503,9 @@ def choice_keyboard():
     ])
 
 
-def voting_keyboard(number: int) -> InlineKeyboardMarkup:
+async def voting_keyboard(number: int) -> InlineKeyboardMarkup:
     """Build the 👍 upvote button shown under a posted question, with the live count."""
-    votes = load_votes(number)
+    votes = await load_votes(number)
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(f"👍 Upvote ({votes['count']})", callback_data=f"upvote_{number}")
     ]])
@@ -547,7 +530,7 @@ AD_DOMAINS = {
 }
 
 
-def extract_urls(text: str) -> list:
+async def extract_urls(text: str) -> list:
     """
     Return all URLs found in text.
     Catches both explicit https:// links AND bare domain links
@@ -557,7 +540,7 @@ def extract_urls(text: str) -> list:
     explicit = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', text)
 
     # Bare known-ad domains without protocol (e.g. "xhslink.com/abc123")
-    domains = active_ad_domains()
+    domains = await active_ad_domains()
     bare = []
     if domains:
         bare_pattern = r'\b(?:' + '|'.join(re.escape(d) for d in domains) + r')[^\s]*'
@@ -573,18 +556,21 @@ def extract_urls(text: str) -> list:
     return result
 
 
-def is_blocklisted(urls: list) -> bool:
+async def is_blocklisted(urls: list) -> bool:
     """
     Return True if any URL belongs to a known ad/spam domain.
     Handles both https://domain/path and bare domain/path formats.
     """
+    if not urls:
+        return False
+    domains = await active_ad_domains()  # fetched once, not once per URL
     for url in urls:
         # Try to extract domain from URL with or without protocol
         m = re.search(r'(?:https?://)?([^/\s?#]+)', url, re.IGNORECASE)
         if not m:
             continue
         domain = normalize_domain(m.group(1))
-        for ad_domain in active_ad_domains():
+        for ad_domain in domains:
             if domain == ad_domain or domain.endswith("." + ad_domain):
                 logger.info("Blocklist hit: domain=%s matched rule=%s", domain, ad_domain)
                 return True
@@ -758,8 +744,8 @@ async def apply_filter(
     if not content or content == "(voice message)":
         return False
 
-    urls = extract_urls(content)
-    blocklisted = is_blocklisted(urls)
+    urls = await extract_urls(content)
+    blocklisted = await is_blocklisted(urls)
     if not FILTER_ENABLED and not blocklisted:
         return False
 
@@ -769,7 +755,10 @@ async def apply_filter(
 
     # ── Fast blocklist check — no AI cost, instant result ─────────────────
     if blocklisted:
-        await checking_msg.delete()
+        try:
+            await checking_msg.delete()
+        except Exception:
+            pass
         category   = "ad"
         confidence = 1.0
         reason     = "Domain is on the known ad/spam blocklist (e.g. XHS, Shopee referral link)."
@@ -792,7 +781,7 @@ async def apply_filter(
             "timestamp":          timestamp,
             "status":             STATUS_PENDING_APPROVAL,
         }
-        save_pending_reviews(pending_reviews)
+        await save_pending_reviews(pending_reviews)
 
         logger.info(
             "BLOCKLIST HIT | %-10s | 100%% | id=%s | user_id=%d | %s",
@@ -829,7 +818,7 @@ async def apply_filter(
             except Exception as exc:
                 logger.warning("Failed to send blocklist review to admin: %s", exc)
 
-        append_filter_log({
+        await append_filter_log({
             "timestamp":  timestamp,
             "user_id":    user.id,
             "full_name":  user.full_name,
@@ -843,7 +832,7 @@ async def apply_filter(
             "method":     "blocklist",
         })
 
-        append_log({
+        await append_log({
             "number":     None,
             "timestamp":  timestamp,
             "post_type":  None,
@@ -874,7 +863,10 @@ async def apply_filter(
     url_rep       = await check_urls_serper(urls)
     filter_result = await run_ai_filter(content, url_rep)
 
-    await checking_msg.delete()
+    try:
+        await checking_msg.delete()
+    except Exception:
+        pass
 
     confidence = filter_result.get("confidence", 0.0)
     if not filter_result.get("flagged") or confidence < FILTER_CONFIDENCE_THRESHOLD:
@@ -907,7 +899,7 @@ async def apply_filter(
         "timestamp":          timestamp,
         "status":             STATUS_PENDING_APPROVAL,
     }
-    save_pending_reviews(pending_reviews)
+    await save_pending_reviews(pending_reviews)
 
     logger.info(
         "PENDING REVIEW | %-10s | %.0f%% | id=%s | user_id=%d | %s",
@@ -946,7 +938,7 @@ async def apply_filter(
             logger.warning("Failed to send review request to admin: %s", exc)
 
     # ── Log as pending_approval (status field added for filter_stats) ──────
-    append_filter_log({
+    await append_filter_log({
         "timestamp":  timestamp,
         "user_id":    user.id,
         "full_name":  user.full_name,
@@ -959,7 +951,7 @@ async def apply_filter(
         "review_id":  review_id,
     })
 
-    append_log({
+    await append_log({
         "number":     None,
         "timestamp":  timestamp,
         "post_type":  None,
@@ -1027,7 +1019,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Pop from dict so double-clicks are safely ignored
     review = pending_reviews.pop(review_id, None)
     if review:
-        save_pending_reviews(pending_reviews)  # persist removal to Redis
+        await save_pending_reviews(pending_reviews)  # persist removal to Redis
     if not review:
         await query.answer("⚠️ Already handled or expired.", show_alert=True)
         try:
@@ -1064,12 +1056,12 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as exc:
             logger.warning("Could not edit review card after rejection: %s", exc)
 
-        update_log_by_review_id(review_id, {
+        await update_log_by_review_id(review_id, {
             "status": STATUS_REJECTED,
             "rejected_at": timestamp,
             "rejected_by": admin_user.id if admin_user else None,
         })
-        update_filter_log_by_review_id(review_id, {
+        await update_filter_log_by_review_id(review_id, {
             "status": STATUS_REJECTED,
             "reviewed_at": timestamp,
             "reviewed_by": admin_user.id if admin_user else None,
@@ -1079,11 +1071,11 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ── APPROVE ───────────────────────────────────────────────────────────
     is_anonymous = (action == "approve_anon")
-    confession_count = incr_count()
+    new_count = await incr_count()
     post_type = "Anonymous" if is_anonymous else "Public"
 
     if is_anonymous:
-        author_label = f"Anonymous Question #{confession_count}"
+        author_label = f"Anonymous Question #{new_count}"
     else:
         # Use the stored username/name from when the question was submitted
         display_name = (
@@ -1091,7 +1083,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             if review["username_str"] != "no username"
             else review["full_name"]
         )
-        author_label = f"👤 Question #{confession_count} by {display_name}"
+        author_label = f"👤 Question #{new_count} by {display_name}"
 
     msg_type = ud.get("type")
     content  = ud.get("content", "")
@@ -1101,7 +1093,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Post to channel
         msg_id, msg_id_2 = await post_to_group(
             context, msg_type, author_label, content, file_id,
-            reply_markup=voting_keyboard(confession_count),
+            reply_markup=await voting_keyboard(new_count),
         )
 
         # DM the user with the approval news
@@ -1109,7 +1101,7 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_message(
                 chat_id=user_chat_id,
                 text=(
-                    f"✅ *Your question #{confession_count} was approved and posted!*\n\n"
+                    f"✅ *Your question #{new_count} was approved and posted!*\n\n"
                     "Type /start to send another question."
                 ),
                 parse_mode="Markdown",
@@ -1118,8 +1110,8 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.warning("Could not DM approval to user: %s", exc)
 
         # Update the pending database/log row instead of creating a duplicate.
-        saved = update_log_by_review_id(review_id, {
-            "number":    confession_count,
+        saved = await update_log_by_review_id(review_id, {
+            "number":    new_count,
             "timestamp": timestamp,
             "post_type": post_type,
             "user_id":   review["user_id"],
@@ -1139,8 +1131,8 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
             ),
         })
         if not saved:
-            append_log({
-                "number":    confession_count,
+            await append_log({
+                "number":    new_count,
                 "timestamp": timestamp,
                 "post_type": post_type,
                 "user_id":   review["user_id"],
@@ -1160,32 +1152,32 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
                     f"({review['confidence']:.0%} confidence)"
                 ),
             })
-        update_filter_log_by_review_id(review_id, {
+        await update_filter_log_by_review_id(review_id, {
             "status": STATUS_PUBLISHED,
             "reviewed_at": timestamp,
             "reviewed_by": admin_user.id if admin_user else None,
-            "posted_number": confession_count,
+            "posted_number": new_count,
         })
 
         # Update the review card in admin chat (removes buttons, appends status)
         try:
             await query.edit_message_text(
                 original_text
-                + f"\n\n✅ Approved — posted as Question #{confession_count} ({post_type}).",
+                + f"\n\n✅ Approved — posted as Question #{new_count} ({post_type}).",
             )
         except Exception as exc:
             logger.warning("Could not edit review card after approval: %s", exc)
 
         logger.info(
             "Admin APPROVED review_id=%s → Question #%d | %s | user_id=%d",
-            review_id, confession_count, post_type, review["user_id"],
+            review_id, new_count, post_type, review["user_id"],
         )
 
     except Exception as exc:
         logger.error("Failed to post admin-approved question: %s", exc)
-        decr_count()
+        await decr_count()
         pending_reviews[review_id] = review
-        save_pending_reviews(pending_reviews)
+        await save_pending_reviews(pending_reviews)
         try:
             await query.edit_message_text(
                 original_text
@@ -1209,7 +1201,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     # Starting a fresh question supersedes any pending clarification request
     if awaiting_clarification.pop(user.id, None) is not None:
-        save_awaiting_clarification(awaiting_clarification)
+        await save_awaiting_clarification(awaiting_clarification)
     context.user_data.clear()
     await update.message.reply_text(
         "🤫 *Anonymous Q&A*\n\n"
@@ -1315,9 +1307,14 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         context.user_data["editing"] = True
         return WAITING_CONFESSION
 
+    # ── Guard against a fast double-tap posting the same question twice ────
+    if ud.pop("posted", None):
+        return ConversationHandler.END
+    ud["posted"] = True
+
     # ── Build label shown in channel ───────────────────────────────────────
     is_anonymous = (choice == "post_anonymous")
-    confession_count = incr_count()
+    confession_count = await incr_count()
 
     if is_anonymous:
         author_label = f"Anonymous Question #{confession_count}"
@@ -1333,7 +1330,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         # ── Post to channel ────────────────────────────────────────────────
         msg_id, msg_id_2 = await post_to_group(
             context, msg_type, author_label, content, file_id,
-            reply_markup=voting_keyboard(confession_count),
+            reply_markup=await voting_keyboard(confession_count),
         )
 
         # ── Silent admin notification ──────────────────────────────────────
@@ -1375,7 +1372,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         }
         if msg_id_2:
             log_entry["message_id_2"] = msg_id_2
-        append_log(log_entry)
+        await append_log(log_entry)
 
         # ── Confirm to user ────────────────────────────────────────────────
         await query.edit_message_text(
@@ -1390,7 +1387,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     except Exception as exc:
         logger.error("Failed to post question: %s", exc)
-        decr_count()
+        await decr_count()
         await query.edit_message_text(
             "❌ Couldn't post your question.\n"
             "The item was not published. Please try again later."
@@ -1432,7 +1429,7 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Please provide a valid number.")
         return
 
-    entry = next((e for e in load_log() if e.get("number") == target), None)
+    entry = next((e for e in await load_log() if e.get("number") == target), None)
 
     if not entry:
         await update.message.reply_text(f"❌ No record for Question #{target}.")
@@ -1458,7 +1455,7 @@ async def filter_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("⛔ Admins only.")
         return
 
-    log   = load_filter_log()
+    log   = await load_filter_log()
     total = len(log)
 
     if total == 0:
@@ -1586,7 +1583,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     banned_users.add(target_id)
-    save_banned_users(banned_users)
+    await save_banned_users(banned_users)
     logger.info("Admin BANNED user_id=%d", target_id)
     await update.message.reply_text(
         f"✅ User `{target_id}` has been banned.\n"
@@ -1618,7 +1615,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     banned_users.discard(target_id)
-    save_banned_users(banned_users)
+    await save_banned_users(banned_users)
     logger.info("Admin UNBANNED user_id=%d", target_id)
     await update.message.reply_text(
         f"✅ User `{target_id}` has been unbanned and can submit questions again.",
@@ -1646,7 +1643,7 @@ async def delete_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Please provide a valid question number.")
         return
 
-    entry = next((e for e in load_log() if e.get("number") == target), None)
+    entry = next((e for e in await load_log() if e.get("number") == target), None)
     if not entry:
         await update.message.reply_text(f"❌ No record found for Question #{target}.")
         return
@@ -1679,14 +1676,14 @@ async def delete_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             failed.append(f"overflow text ({exc})")
 
     # Update log entry status
-    log = load_log()
+    log = await load_log()
     for e in log:
         if e.get("number") == target:
             e["status"]     = "deleted"
             e["deleted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             e["deleted_by"] = update.effective_user.id
             break
-    save_log(log)
+    await save_log(log)
 
     parts = []
     if deleted:
@@ -1751,7 +1748,7 @@ async def ask_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     clarification_text = " ".join(context.args[1:]).strip()
 
-    entry = next((e for e in load_log() if e.get("number") == target), None)
+    entry = next((e for e in await load_log() if e.get("number") == target), None)
     if not entry or not entry.get("user_id"):
         await update.message.reply_text(f"❌ No record found for Question #{target}.")
         return
@@ -1775,7 +1772,7 @@ async def ask_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     awaiting_clarification[asker_id] = target
-    save_awaiting_clarification(awaiting_clarification)
+    await save_awaiting_clarification(awaiting_clarification)
 
     await update.message.reply_text(
         f"✅ Clarification request sent for Question #{target}.\n"
@@ -1799,7 +1796,7 @@ async def handle_clarification_reply(update: Update, context: ContextTypes.DEFAU
         return  # not a clarification reply — let other handlers process it
 
     target = awaiting_clarification.pop(user.id)
-    save_awaiting_clarification(awaiting_clarification)
+    await save_awaiting_clarification(awaiting_clarification)
 
     reply_text = (
         update.message.text
@@ -1833,14 +1830,14 @@ async def handle_upvote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer()
         return
 
-    votes = load_votes(number)
+    votes = await load_votes(number)
     if user.id in votes["voters"]:
         await query.answer("You've already upvoted this question 👍", show_alert=False)
         return
 
     votes["voters"].append(user.id)
     votes["count"] = len(votes["voters"])
-    save_votes(number, votes)
+    await save_votes(number, votes)
 
     await query.answer("👍 Upvoted!")
 
@@ -1853,11 +1850,47 @@ async def handle_upvote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.warning("Could not update vote count display for Question #%d: %s", number, exc)
 
 
+# ─── Startup: load persisted state once the bot's event loop is running ──────
+async def post_init(application: Application) -> None:
+    """
+    Runs once, automatically, after the Application's event loop starts but
+    before polling begins. This is the supported place to do async setup —
+    it replaces the old pattern of calling the (now-async) Redis loaders
+    directly inside the synchronous main().
+    """
+    global confession_count, pending_reviews, banned_users, awaiting_clarification
+    confession_count        = await load_count()
+    pending_reviews         = await load_pending_reviews()
+    banned_users            = await load_banned_users()
+    awaiting_clarification  = await load_awaiting_clarification()
+    logger.info(
+        "Loaded from Redis — question_count=%d, pending_reviews=%d, banned_users=%d, awaiting_clarification=%d",
+        confession_count, len(pending_reviews), len(banned_users), len(awaiting_clarification),
+    )
+
+
+# ─── Global error handler — keeps a bad update from failing silently ─────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled exception while processing an update", exc_info=context.error)
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"⚠️ Bot error while processing an update: {context.error}",
+            )
+        except Exception:
+            pass  # don't let a failed error-report itself raise
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 def main() -> None:
     if not BOT_TOKEN:
         print("❌  BOT_TOKEN is not set.")
         return
+    if not GROUP_CHAT_ID:
+        logger.warning("GROUP_CHAT_ID is not set — approved questions have nowhere to post.")
+    if not ADMIN_CHAT_ID:
+        logger.warning("ADMIN_CHAT_ID is not set — admin-only commands and review queues won't work.")
 
     if not FILTER_ENABLED:
         logger.warning(
@@ -1875,16 +1908,15 @@ def main() -> None:
             serper_status,
         )
 
-    # Fix for Python 3.10+ event-loop policy
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
     # Start Flask in background thread so Render sees an HTTP server
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("Flask health server started on port %d", PORT)
 
-    # Build Telegram app
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    # Build Telegram app — post_init runs the Redis state load below once
+    # the application's own event loop is up.
+    telegram_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    telegram_app.add_error_handler(error_handler)
 
     # ── IMPORTANT: admin review handler must be registered BEFORE the
     #   ConversationHandler so its pattern is matched first. The patterns
@@ -1936,17 +1968,6 @@ def main() -> None:
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         prompt_start,
     ))
-
-    # ── Load persistent state from Redis ──────────────────────────────────
-    global confession_count, pending_reviews, banned_users, awaiting_clarification
-    confession_count        = load_count()
-    pending_reviews         = load_pending_reviews()
-    banned_users            = load_banned_users()
-    awaiting_clarification  = load_awaiting_clarification()
-    logger.info(
-        "Loaded from Redis — question_count=%d, pending_reviews=%d, banned_users=%d, awaiting_clarification=%d",
-        confession_count, len(pending_reviews), len(banned_users), len(awaiting_clarification),
-    )
 
     print("🤖  Q&A bot is running.")
     telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
