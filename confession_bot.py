@@ -1969,6 +1969,14 @@ def main() -> None:
         prompt_start,
     ))
 
+# ─── Python 3.14 Event Loop Patch ───
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    # ─────────────────────────────────────
+
     print("🤖  Q&A bot is running.")
     telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
