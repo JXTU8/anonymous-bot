@@ -6,12 +6,13 @@ Telegram Anonymous Q&A Bot (for classroom use)
 - Teacher (admin) always gets a silent DM with full asker identity
 - AI filter (Groq llama-3.3-70b + Serper) queues high-risk messages for
   admin review — never auto-deletes
-- Students can anonymously upvote questions in the group
+- Students react 👍/👎 directly on questions in the group using Telegram's
+  native message reactions (no inline button — keeps the chat compact)
 - Teacher answers by copy-pasting the question into the group as a reply —
   no bot command needed for this
 - /ask <#> <text> sends the asker an anonymous DM requesting clarification;
   their reply is relayed back to the teacher
-- Question count, votes, and pending reviews persisted in Upstash Redis
+- Question count and pending reviews persisted in Upstash Redis
   (survive bot restarts)
 """
 
@@ -41,11 +42,37 @@ from telegram.ext import (
 
 load_dotenv()
 
+
+def _env_int(name: str, default: int = 0) -> int:
+    """
+    Read an integer environment variable safely.
+
+    Plain int(os.getenv(name, "0")) crashes the whole process at import
+    time (before any error handler exists to catch it) if the variable is
+    *set but blank* — e.g. someone added GROUP_CHAT_ID in the Render
+    dashboard and left the value empty while typing it in. os.getenv then
+    returns "" (not None), and int("") raises ValueError. That takes the
+    entire bot down on every single startup attempt until the env var is
+    fixed. This logs a clear warning and falls back to `default` instead.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "Environment variable %s=%r is not a valid integer — using default %d",
+            name, raw, default,
+        )
+        return default
+
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 BOT_TOKEN           = os.getenv("BOT_TOKEN", "")
-GROUP_CHAT_ID       = int(os.getenv("GROUP_CHAT_ID", "0"))
-ADMIN_CHAT_ID       = int(os.getenv("ADMIN_CHAT_ID", "0"))
-PORT                = int(os.getenv("PORT", 8080))
+GROUP_CHAT_ID       = _env_int("GROUP_CHAT_ID")
+ADMIN_CHAT_ID       = _env_int("ADMIN_CHAT_ID")
+PORT                = _env_int("PORT", 8080)
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
 SERPER_API_KEY      = os.getenv("SERPER_API_KEY", "")
 UPSTASH_REDIS_URL   = os.getenv("UPSTASH_REDIS_REST_URL", "")
@@ -64,7 +91,6 @@ REDIS_LOG_KEY     = "confession:log"
 REDIS_FILTER_KEY  = "confession:filter_log"
 REDIS_DOMAINS_KEY = "confession:custom_block_domains"
 REDIS_BANNED_KEY  = "confession:banned_users"
-REDIS_VOTES_PREFIX = "confession:votes:"
 REDIS_CLARIFY_KEY  = "confession:awaiting_clarification"
 
 RATE_LIMIT_SECONDS = 5
@@ -93,7 +119,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Flask health server (keeps Render free tier alive) ───────────────────────
+# ─── Flask health server ───────────────────────────────────────────────────────
+# NOTE: this endpoint by itself does NOT keep a Render free-tier service awake.
+# Render's free plan spins a web service down after 15 minutes with no INBOUND
+# HTTP request — and a long-polling Telegram bot never receives inbound HTTP
+# requests (it only makes outbound calls to Telegram). Render's own health
+# probes don't count as activity either, by design. This route only helps if
+# something external actually calls it periodically — e.g. a free uptime
+# monitor (UptimeRobot, cron-job.org, etc.) hitting /health every 5–10 min.
+# See the root-cause note in render.yaml for details.
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -352,25 +386,6 @@ async def save_banned_users(banned: set) -> None:
     await redis_set(REDIS_BANNED_KEY, json.dumps(sorted(banned), ensure_ascii=False))
 
 
-# ─── Upvotes (Redis-backed, one key per question number) ────────────────────
-async def load_votes(number: int) -> dict:
-    """Load {'count': int, 'voters': [user_id, ...]} for a question. Defaults to empty."""
-    raw = await redis_get(f"{REDIS_VOTES_PREFIX}{number}")
-    if not raw:
-        return {"count": 0, "voters": []}
-    try:
-        data = json.loads(raw)
-        voters = [int(v) for v in data.get("voters", [])]
-        return {"count": len(voters), "voters": voters}
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return {"count": 0, "voters": []}
-
-
-async def save_votes(number: int, data: dict) -> None:
-    """Persist vote data for a question."""
-    await redis_set(f"{REDIS_VOTES_PREFIX}{number}", json.dumps(data, ensure_ascii=False))
-
-
 # ─── Pending clarification requests (Redis-backed) ───────────────────────────
 # Maps user_id -> question number the admin is asking them to clarify.
 # Consumed by handle_clarification_reply when the student replies.
@@ -419,8 +434,11 @@ async def post_to_group(
     Returns (primary_message_id, secondary_message_id_or_None).
     For photo/video that exceed the caption limit, two messages are sent —
     both IDs are returned so /delete can remove both.
-    reply_markup (if given) is attached to the primary message only — this
-    is how the 👍 upvote button gets attached to new questions.
+    reply_markup (if given) is attached to the primary message only. Not
+    currently used for posted questions — students react with Telegram's
+    native 👍/👎 message reactions instead of an inline button, to keep
+    the chat compact. Kept as a parameter in case a future feature needs
+    an inline keyboard here.
     """
     text = f"{author_label}\n\n{content}".strip()
     if msg_type == "text":
@@ -502,13 +520,6 @@ def choice_keyboard():
         ],
     ])
 
-
-async def voting_keyboard(number: int) -> InlineKeyboardMarkup:
-    """Build the 👍 upvote button shown under a posted question, with the live count."""
-    votes = await load_votes(number)
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"👍 Upvote ({votes['count']})", callback_data=f"upvote_{number}")
-    ]])
 
 # ─── Known ad/spam domains — checked instantly before AI ─────────────────────
 # Add any domain you keep seeing spammed in confessions.
@@ -1090,10 +1101,10 @@ async def handle_admin_review(update: Update, context: ContextTypes.DEFAULT_TYPE
     file_id  = ud.get("file_id", "")
 
     try:
-        # Post to channel
+        # Post to channel — no inline keyboard; students react with 👍/👎
+        # directly on the message using Telegram's native reactions.
         msg_id, msg_id_2 = await post_to_group(
             context, msg_type, author_label, content, file_id,
-            reply_markup=await voting_keyboard(new_count),
         )
 
         # DM the user with the approval news
@@ -1327,10 +1338,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     file_id  = ud.get("file_id", "")
 
     try:
-        # ── Post to channel ────────────────────────────────────────────────
+        # ── Post to channel — no inline keyboard; students react with 👍/👎
+        #    directly on the message using Telegram's native reactions. ──────
         msg_id, msg_id_2 = await post_to_group(
             context, msg_type, author_label, content, file_id,
-            reply_markup=await voting_keyboard(confession_count),
         )
 
         # ── Silent admin notification ──────────────────────────────────────
@@ -1711,8 +1722,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• 👤 *Post Publicly* — your @username is shown\n"
         "• ✏️ *Edit* — rewrite your question before posting\n"
         "• ❌ *Cancel* — discard and start over\n\n"
-        "👍 *Upvoting:* tap the upvote button under any question in the group "
-        "to show it's something you'd like answered too\n\n"
+        "👍 *Reacting:* tap and hold (long-press) any question in the group "
+        "and pick 👍 or 👎 to show it's something you'd like answered too\n\n"
         "⏱️ *Rate limit:* 5 seconds between submissions\n\n"
         "📋 *Commands:*\n"
         "/start — Ask a new question\n"
@@ -1818,38 +1829,6 @@ async def handle_clarification_reply(update: Update, context: ContextTypes.DEFAU
     raise ApplicationHandlerStop
 
 
-# ─── Student: tap 👍 to upvote a question ──────────────────────────────────────
-async def handle_upvote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anonymous upvote — one vote per user per question, tracked in Redis."""
-    query = update.callback_query
-    user  = update.effective_user
-
-    try:
-        number = int(query.data.split("_", 1)[1])
-    except (IndexError, ValueError):
-        await query.answer()
-        return
-
-    votes = await load_votes(number)
-    if user.id in votes["voters"]:
-        await query.answer("You've already upvoted this question 👍", show_alert=False)
-        return
-
-    votes["voters"].append(user.id)
-    votes["count"] = len(votes["voters"])
-    await save_votes(number, votes)
-
-    await query.answer("👍 Upvoted!")
-
-    new_keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"👍 Upvote ({votes['count']})", callback_data=f"upvote_{number}")
-    ]])
-    try:
-        await query.edit_message_reply_markup(reply_markup=new_keyboard)
-    except Exception as exc:
-        logger.warning("Could not update vote count display for Question #%d: %s", number, exc)
-
-
 # ─── Startup: load persisted state once the bot's event loop is running ──────
 async def post_init(application: Application) -> None:
     """
@@ -1951,7 +1930,6 @@ def main() -> None:
     )
 
     telegram_app.add_handler(conv_handler)
-    telegram_app.add_handler(CallbackQueryHandler(handle_upvote, pattern=r"^upvote_\d+$"))
     telegram_app.add_handler(CommandHandler("getid",        get_chat_id))
     telegram_app.add_handler(CommandHandler("lookup",       lookup))
     telegram_app.add_handler(CommandHandler("filter_stats", filter_stats))
@@ -1968,14 +1946,6 @@ def main() -> None:
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         prompt_start,
     ))
-
-# ─── Python 3.14 Event Loop Patch ───
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    # ─────────────────────────────────────
 
     print("🤖  Q&A bot is running.")
     telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)

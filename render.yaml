@@ -1,8 +1,28 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPORTANT — about the "crashes":
+# Render's FREE web service plan spins the instance down after 15 minutes
+# with no INBOUND HTTP request. This bot uses long-polling (it only makes
+# OUTBOUND calls to Telegram), so nothing ever hits it over HTTP — Render
+# sees it as idle and puts it to sleep, repeatedly, regardless of how many
+# Telegram messages are flowing. Render's own health-check probes do NOT
+# count as activity (by design, to prevent free-tier abuse), so the
+# Flask /health route alone does not keep it awake.
+#
+# The PYTHON_VERSION bump did not (and could not) fix this — it's an
+# infra/plan issue, not a Python issue.
+#
+# Fix: point a free external uptime monitor (e.g. UptimeRobot,
+# cron-job.org, or healthchecks.io) at https://<your-service>.onrender.com/health
+# every 5–10 minutes. That's genuine third-party traffic, so Render keeps
+# the instance awake. Alternatively, upgrade `plan` below to `starter` or
+# higher, which removes spin-down entirely.
+# ─────────────────────────────────────────────────────────────────────────────
 services:
   - type: web
     name: confession-bot
     runtime: python
     plan: free
+    healthCheckPath: /health
     buildCommand: pip install -r requirements.txt
     startCommand: python confession_bot.py
     envVars:
