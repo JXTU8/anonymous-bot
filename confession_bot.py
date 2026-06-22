@@ -119,6 +119,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Silence httpx INFO logs — every Telegram API call URL contains the bot
+# token (e.g. /bot<TOKEN>/sendMessage), so INFO-level HTTP request logging
+# leaks the token in plain text to stdout / Render logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ─── Flask health server ───────────────────────────────────────────────────────
 # NOTE: this endpoint by itself does NOT keep a Render free-tier service awake.
 # Render's free plan spins a web service down after 15 minutes with no INBOUND
