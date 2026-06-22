@@ -1850,21 +1850,16 @@ async def post_init(application: Application) -> None:
 
 # ─── Global error handler — keeps a bad update from failing silently ─────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
-
     err = context.error
 
-    # ── Transient / infrastructure errors — log only, never notify admin ──────
-    # Conflict:     two instances briefly polling at the same time (redeploy).
-    #               Expected and self-resolving; notifying the admin is pure noise.
-    # NetworkError / TimedOut / RetryAfter:
-    #               Render free-tier network blips, Telegram rate limits.
-    #               Also expected; spamming admin on every blip is unhelpful.
-    if isinstance(err, (Conflict, NetworkError, TimedOut, RetryAfter)):
-        logger.warning("Transient error (not reported to admin): %s", err)
+    # ── update is None → error came from the polling / network layer ──────────
+    # This includes Conflict (two instances during redeploy), NetworkError,
+    # TimedOut, RetryAfter, and any future PTB network exception.
+    # PTB retries these automatically; they are never worth logging or reporting.
+    if update is None:
         return
 
-    # ── Real / unexpected errors — log fully and notify admin ─────────────────
+    # ── update is set → real error while processing a user message ────────────
     logger.error("Unhandled exception while processing an update", exc_info=err)
     if ADMIN_CHAT_ID:
         try:
