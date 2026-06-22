@@ -1948,7 +1948,16 @@ def main() -> None:
     ))
 
     print("🤖  Q&A bot is running.")
-    telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates=True sends a getUpdates(timeout=0) on startup which
+    # forces Telegram to close any long-poll held by a lingering old instance.
+    # Without this, a Render redeploy causes a brief Conflict spam while the
+    # old process is still alive alongside the new one.
+    # Trade-off: messages sent during the seconds of downtime are skipped —
+    # acceptable for a confession bot.
+    telegram_app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
