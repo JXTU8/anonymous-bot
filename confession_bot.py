@@ -1850,12 +1850,27 @@ async def post_init(application: Application) -> None:
 
 # ─── Global error handler — keeps a bad update from failing silently ─────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled exception while processing an update", exc_info=context.error)
+    from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
+
+    err = context.error
+
+    # ── Transient / infrastructure errors — log only, never notify admin ──────
+    # Conflict:     two instances briefly polling at the same time (redeploy).
+    #               Expected and self-resolving; notifying the admin is pure noise.
+    # NetworkError / TimedOut / RetryAfter:
+    #               Render free-tier network blips, Telegram rate limits.
+    #               Also expected; spamming admin on every blip is unhelpful.
+    if isinstance(err, (Conflict, NetworkError, TimedOut, RetryAfter)):
+        logger.warning("Transient error (not reported to admin): %s", err)
+        return
+
+    # ── Real / unexpected errors — log fully and notify admin ─────────────────
+    logger.error("Unhandled exception while processing an update", exc_info=err)
     if ADMIN_CHAT_ID:
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"⚠️ Bot error while processing an update: {context.error}",
+                text=f"⚠️ Bot error while processing an update: {err}",
             )
         except Exception:
             pass  # don't let a failed error-report itself raise
